@@ -9,7 +9,7 @@ import QRCode from 'qrcode';
 import pg from 'pg';
 import pino from 'pino';
 import { rmSync } from 'fs';
-import makeWASocket, { DisconnectReason, useMultiFileAuthState } from '@whiskeysockets/baileys';
+import makeWASocket, { DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } from '@whiskeysockets/baileys';
 
 const { Pool } = pg;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -88,12 +88,17 @@ async function connectWA() {
     const { state, saveCreds } = await useMultiFileAuthState(WA_DIR);
     waLog('✅ Auth state carregado');
 
+    const { version } = await fetchLatestBaileysVersion();
+    waLog(`📦 WA version: ${version.join('.')}`);
+
     const sock = makeWASocket({
+      version,
       auth: state,
       logger,
       printQRInTerminal: false,
-      browser: ['MotoBot', 'Chrome', '120'],
+      browser: Browsers.macOS('Desktop'),
       connectTimeoutMs: 60000,
+      getMessage: async () => ({ conversation: '' }),
     });
     waLog('✅ Socket criado, aguardando conexão...');
 
