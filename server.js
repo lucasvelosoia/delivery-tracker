@@ -9,7 +9,7 @@ import QRCode from 'qrcode';
 import pg from 'pg';
 import pino from 'pino';
 import { rmSync } from 'fs';
-import makeWASocket, { DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } from '@whiskeysockets/baileys';
+import makeWASocket, { DisconnectReason, useMultiFileAuthState, fetchLatestBaileysVersion, Browsers, BufferJSON, initAuthCreds } from '@whiskeysockets/baileys';
 
 const { Pool } = pg;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -87,6 +87,59 @@ const clients         = new Map(); // phone → { name, pickupAddress, pickupCoo
 const orders          = new Map();
 const paymentToOrder  = new Map();
 
+// ── WhatsApp auth state persistente no PostgreSQL ────────────────────────────
+async function usePostgresAuthState(pool) {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS wa_auth (
+      key   TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    )
+  `);
+
+  const readData = async (key) => {
+    const r = await pool.query('SELECT value FROM wa_auth WHERE key=$1', [key]);
+    return r.rows[0] ? JSON.parse(r.rows[0].value, BufferJSON.reviver) : null;
+  };
+  const writeData = (key, data) =>
+    pool.query(
+      'INSERT INTO wa_auth(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=$2',
+      [key, JSON.stringify(data, BufferJSON.replacer)]
+    );
+  const removeData = (key) => pool.query('DELETE FROM wa_auth WHERE key=$1', [key]);
+
+  let creds = (await readData('creds')) || initAuthCreds();
+
+  return {
+    state: {
+      creds,
+      keys: {
+        get: async (type, ids) => {
+          if (!ids.length) return {};
+          const ph   = ids.map((_, i) => `$${i + 1}`).join(',');
+          const rows = await pool.query(
+            `SELECT key, value FROM wa_auth WHERE key IN (${ph})`,
+            ids.map(id => `${type}-${id}`)
+          );
+          const data = {};
+          for (const row of rows.rows) {
+            const id = row.key.slice(type.length + 1);
+            data[id] = JSON.parse(row.value, BufferJSON.reviver);
+          }
+          return data;
+        },
+        set: async (data) => {
+          const tasks = [];
+          for (const [type, typeData] of Object.entries(data))
+            for (const [id, value] of Object.entries(typeData))
+              tasks.push(value != null ? writeData(`${type}-${id}`, value) : removeData(`${type}-${id}`));
+          await Promise.all(tasks);
+        },
+      },
+    },
+    saveCreds: () => writeData('creds', creds),
+  };
+}
+
 // ── WhatsApp (Baileys) ────────────────────────────────────────────────────────
 let waSocket  = null;
 let currentQR = null;
@@ -111,8 +164,10 @@ async function connectWA() {
   waReconnecting = true;
   try {
     waLog('🔄 Iniciando Baileys...');
-    const { state, saveCreds } = await useMultiFileAuthState(WA_DIR);
-    waLog('✅ Auth state carregado');
+    const { state, saveCreds } = db
+      ? await usePostgresAuthState(db)
+      : await useMultiFileAuthState(WA_DIR);
+    waLog(`✅ Auth state carregado (${db ? 'PostgreSQL' : 'arquivo'})`);
 
     const { version } = await fetchLatestBaileysVersion();
     waLog(`📦 WA version: ${version.join('.')}`);
@@ -574,11 +629,12 @@ app.post('/webhook/mercadopago', async (req, res) => {
 
 app.get('/health', (_req, res) => res.json({ ok: true, uptime: process.uptime(), whatsapp: waStatus }));
 app.get('/debug',  (_req, res) => res.json({ waStatus, hasQR: !!currentQR, logs: waLogs }));
-app.post('/admin/reset-wa', requireAdmin, (_req, res) => {
+app.post('/admin/reset-wa', requireAdmin, async (_req, res) => {
   waLog('🔄 Reset manual da sessão WA...');
   waReconnecting = false;
   if (waSocket) { try { waSocket.end(undefined); } catch(_) {} waSocket = null; }
-  rmSync(WA_DIR, { recursive: true, force: true });
+  if (db) await db.query('DELETE FROM wa_auth').catch(() => {});
+  else rmSync(WA_DIR, { recursive: true, force: true });
   setTimeout(connectWA, 1000);
   res.json({ ok: true, message: 'Sessão resetada. Acesse /qr para escanear.' });
 });
