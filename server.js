@@ -82,10 +82,53 @@ function waLog(...args) {
   console.log(msg);
 }
 
+// Salva/carrega sessão Baileys no PostgreSQL para sobreviver a restarts
+async function getDBAuthState() {
+  if (!db) return useMultiFileAuthState(WA_DIR); // fallback para arquivo
+
+  await db.query(`CREATE TABLE IF NOT EXISTS wa_session (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
+
+  const read = async (k) => {
+    const r = await db.query('SELECT value FROM wa_session WHERE key=$1', [k]);
+    return r.rows[0] ? JSON.parse(r.rows[0].value) : null;
+  };
+  const write = async (k, v) => db.query(
+    'INSERT INTO wa_session(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=$2',
+    [k, JSON.stringify(v)]
+  );
+  const del = async (k) => db.query('DELETE FROM wa_session WHERE key=$1', [k]);
+
+  const { initAuthCreds, BufferJSON } = await import('@whiskeysockets/baileys');
+
+  const readJSON  = async (k) => { const r = await db.query('SELECT value FROM wa_session WHERE key=$1', [k]); return r.rows[0] ? JSON.parse(r.rows[0].value, BufferJSON.reviver) : null; };
+  const writeJSON = async (k, v) => db.query('INSERT INTO wa_session(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=$2', [k, JSON.stringify(v, BufferJSON.replacer)]);
+
+  const creds = (await readJSON('creds')) || initAuthCreds();
+
+  return {
+    state: {
+      creds,
+      keys: {
+        get: async (type, ids) => {
+          const out = {};
+          await Promise.all(ids.map(async id => { out[id] = await readJSON(`${type}:${id}`); }));
+          return out;
+        },
+        set: async (data) => {
+          await Promise.all(Object.entries(data).flatMap(([type, items]) =>
+            Object.entries(items).map(([id, val]) => val ? writeJSON(`${type}:${id}`, val) : del(`${type}:${id}`))
+          ));
+        },
+      },
+    },
+    saveCreds: () => writeJSON('creds', creds),
+  };
+}
+
 async function connectWA() {
   try {
     waLog('🔄 Iniciando Baileys...');
-    const { state, saveCreds } = await useMultiFileAuthState(WA_DIR);
+    const { state, saveCreds } = await getDBAuthState();
     waLog('✅ Auth state carregado');
 
     const { version } = await fetchLatestBaileysVersion();
@@ -113,7 +156,10 @@ async function connectWA() {
         const code = lastDisconnect?.error?.output?.statusCode;
         const reconnect = code !== DisconnectReason.loggedOut;
         waLog(`⚠️ WA fechou (${code}) — ${reconnect ? 'reconectando' : 'sessão expirada'}`);
-        if (!reconnect) rmSync(WA_DIR, { recursive: true, force: true });
+        if (!reconnect) {
+          rmSync(WA_DIR, { recursive: true, force: true });
+          if (db) await db.query('DELETE FROM wa_session');
+        }
         setTimeout(connectWA, reconnect ? 5000 : 3000);
       }
     });
