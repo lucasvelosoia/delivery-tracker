@@ -90,7 +90,6 @@ async function connectWA() {
   waReconnecting = true;
   try {
     waLog('🔄 Iniciando Baileys...');
-    rmSync(WA_DIR, { recursive: true, force: true }); // sempre sessão limpa
     const { state, saveCreds } = await useMultiFileAuthState(WA_DIR);
     waLog('✅ Auth state carregado');
 
