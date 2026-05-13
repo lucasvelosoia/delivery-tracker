@@ -130,16 +130,15 @@ async function connectWA() {
       for (const msg of messages) {
         const jid    = msg.key.remoteJid || '';
         const fromMe = msg.key.fromMe;
-        const phone  = jid.replace('@s.whatsapp.net', '').replace('@g.us', '');
         const text   = msg.message?.conversation
           || msg.message?.extendedTextMessage?.text
           || msg.message?.imageMessage?.caption
           || '';
         waLog(`  jid=${jid} fromMe=${fromMe} type=${type} text="${text.slice(0,30)}"`);
         if (fromMe) continue;
-        if (jid.endsWith('@g.us')) continue; // ignora grupos
+        if (jid.endsWith('@g.us')) continue;
         if (type !== 'notify') continue;
-        if (phone && text) await handleBotMessage(phone, text);
+        if (jid && text) await handleBotMessage(jid, text); // usa JID completo
       }
     });
   } catch (e) {
@@ -150,9 +149,10 @@ async function connectWA() {
   }
 }
 
-async function sendWhatsApp(phone, text) {
-  if (!waSocket) { console.log(`[WA offline → ${phone}]`, text.slice(0, 50)); return; }
-  try { await waSocket.sendMessage(`${phone}@s.whatsapp.net`, { text }); }
+async function sendWhatsApp(phoneOrJid, text) {
+  if (!waSocket) { console.log(`[WA offline → ${phoneOrJid}]`, text.slice(0, 50)); return; }
+  const jid = phoneOrJid.includes('@') ? phoneOrJid : `${phoneOrJid}@s.whatsapp.net`;
+  try { await waSocket.sendMessage(jid, { text }); }
   catch (e) { console.error('WA send error:', e.message); }
 }
 
