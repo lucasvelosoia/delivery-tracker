@@ -1,10 +1,65 @@
+databases:
+  - name: evolution-db
+    plan: free
+    databaseName: evolutiondb
+    user: evolutionuser
+
 services:
+  # ── Servidor principal (Node.js) ──────────────────────────────────────────
   - type: web
     name: delivery-tracker
     runtime: node
     buildCommand: npm install
     startCommand: node server.js
+    healthCheckPath: /health
     envVars:
       - key: NODE_ENV
         value: production
-    healthCheckPath: /health
+      # Preencher após Evolution API ser deployada:
+      # - key: EVOLUTION_API_URL
+      #   value: https://evolution-api.onrender.com
+      # - key: EVOLUTION_API_KEY
+      #   value: SUA_CHAVE
+      # - key: EVOLUTION_INSTANCE
+      #   value: motoboy
+      # - key: MERCADOPAGO_ACCESS_TOKEN
+      #   value: SEU_TOKEN
+      # - key: ADMIN_KEY
+      #   value: SUA_SENHA_ADMIN
+
+  # ── Evolution API (WhatsApp) ──────────────────────────────────────────────
+  - type: web
+    name: evolution-api
+    runtime: image
+    image:
+      url: docker.io/atendai/evolution-api:latest
+    healthCheckPath: /
+    envVars:
+      - key: SERVER_URL
+        sync: false   # preencher com a URL pública após o primeiro deploy
+      - key: AUTHENTICATION_TYPE
+        value: apikey
+      - key: AUTHENTICATION_API_KEY
+        generateValue: true
+      - key: DATABASE_ENABLED
+        value: "true"
+      - key: DATABASE_PROVIDER
+        value: postgresql
+      - key: DATABASE_CONNECTION_URI
+        fromDatabase:
+          name: evolution-db
+          property: connectionString
+      - key: DATABASE_SAVE_DATA_INSTANCE
+        value: "true"
+      - key: DATABASE_SAVE_DATA_NEW_MESSAGE
+        value: "true"
+      - key: DATABASE_SAVE_MESSAGE_UPDATE
+        value: "true"
+      - key: DATABASE_SAVE_DATA_CONTACTS
+        value: "true"
+      - key: DATABASE_SAVE_DATA_CHATS
+        value: "true"
+      - key: QRCODE_LIMIT
+        value: "30"
+      - key: LOG_LEVEL
+        value: ERROR

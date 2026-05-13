@@ -448,6 +448,13 @@ app.post('/webhook/whatsapp', async (req, res) => {
 });
 
 app.get('/health', (_req, res) => res.json({ ok: true, uptime: process.uptime() }));
+
+// Keep-alive: impede o Render de hibernar o serviço no plano gratuito
+if (process.env.NODE_ENV === 'production') {
+  setInterval(() => {
+    fetch(`${HOST_URL}/health`).catch(() => {});
+  }, 14 * 60 * 1000); // ping a cada 14 minutos
+}
 app.get('/track/:deliveryId', (_req, res) =>
   res.sendFile(path.join(__dirname, 'public', 'track.html')));
 
