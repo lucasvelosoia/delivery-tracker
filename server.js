@@ -300,11 +300,33 @@ async function geocode(address) {
       );
       const data = await res.json();
       if (data.length) return { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon), display: data[0].display_name };
-    } catch { /* tenta próxima variação */ }
-    // Nominatim pede no máx 1 req/s
+    } catch {}
     await new Promise(r => setTimeout(r, 1100));
   }
+
+  // Fallback: Photon (OpenStreetMap, cobertura melhor para endereços brasileiros)
+  try {
+    const res  = await fetchWithTimeout(
+      `https://photon.komoot.io/api/?q=${encodeURIComponent(addr + ', Brasil')}&limit=1&lang=pt`,
+      {}, 8000
+    );
+    const data = await res.json();
+    const feat = data?.features?.[0];
+    if (feat) {
+      const [lng, lat] = feat.geometry.coordinates;
+      return { lat, lng, display: feat.properties?.name || addr };
+    }
+  } catch {}
+
   return null;
+}
+
+function haversineKm(a, b) {
+  const R = 6371, rad = Math.PI / 180;
+  const dLat = (b.lat - a.lat) * rad;
+  const dLon = (b.lng - a.lng) * rad;
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * rad) * Math.cos(b.lat * rad) * Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.asin(Math.sqrt(h)) * 1.4; // ×1.4 fator de tortuosidade urbana
 }
 
 async function getRoadDistanceKm(from, to) {
@@ -314,8 +336,10 @@ async function getRoadDistanceKm(from, to) {
       {}, 8000
     );
     const data = await res.json();
-    return data.code === 'Ok' ? data.routes[0].distance / 1000 : null;
-  } catch { return null; }
+    if (data.code === 'Ok') return data.routes[0].distance / 1000;
+  } catch {}
+  // Fallback: distância em linha reta × 1.4 (aproximação de rota urbana)
+  return haversineKm(from, to);
 }
 
 function calcFreight(km) { return FREIGHT_TABLE.find(t => km <= t.maxKm).price; }
@@ -359,7 +383,7 @@ async function createRequestFromOrder(orderId) {
   await dbUpdateOrder(orderId, { status: 'pending', request_id: requestId });
   if (order.phone && order.establishmentName && order.pickupAddress && order.pickupCoords)
     await saveClient(order.phone, order.establishmentName, order.pickupAddress, order.pickupCoords);
-  await sendWhatsApp(order.phone, `✅ *Pagamento confirmado!*\n\nSeu pedido *#${orderId}* está na fila.\n🛵 Localizando o motoboy mais próximo...`);
+  await sendWhatsApp(order.phone, `✅ *Pedido #${orderId} confirmado!*\n\n🛵 Procurando motoboy disponível...\n\nVocê receberá o link de rastreio assim que um motoboy aceitar.`);
 }
 
 // ── IA (Groq / Llama 3.3) ────────────────────────────────────────────────────
@@ -583,7 +607,7 @@ async function handleBotMessage(phone, text) {
       const pickupLine = session.isReturning
         ? 'Mesmo local da última vez ✅'
         : session.data.pickupAddress;
-      const summary = `📦 *Resumo da entrega:*\n\n👤 *Cliente:* ${session.data.name}\n🏪 *Retirada:* ${pickupLine}\n📍 *Entrega:* ${session.data.deliveryAddress}\n📏 *Distância:* ${session.data.distanceKm} km\n💰 *Frete:* R$ ${session.data.freightPrice.toFixed(2).replace('.', ',')}${session.data.note ? `\n📝 *Obs:* ${session.data.note}` : ''}\n\nConfirma o pedido? Responda *SIM* para gerar o PIX.`;
+      const summary = `📦 *Resumo da entrega:*\n\n👤 *Cliente:* ${session.data.name}\n🏪 *Retirada:* ${pickupLine}\n📍 *Entrega:* ${session.data.deliveryAddress}\n📏 *Distância:* ${session.data.distanceKm} km\n💰 *Frete:* R$ ${session.data.freightPrice.toFixed(2).replace('.', ',')}${session.data.note ? `\n📝 *Obs:* ${session.data.note}` : ''}\n\nConfirma o pedido? Responda *SIM* para solicitar o motoboy.`;
 
       session.history.push({ role: 'assistant', content: summary });
       sessions.set(phone, session);
@@ -616,7 +640,7 @@ async function handleBotMessage(phone, text) {
         session.data.distanceKm     = Math.round(km * 10) / 10;
         session.data.freightPrice   = calcFreight(km);
         const pickupLine = session.isReturning ? 'Mesmo local da última vez ✅' : session.data.pickupAddress;
-        const summary = `📦 *Resumo da entrega:*\n\n👤 *Cliente:* ${session.data.name}\n🏪 *Retirada:* ${pickupLine}\n📍 *Entrega:* ${session.data.deliveryAddress}\n📏 *Distância:* ${session.data.distanceKm} km\n💰 *Frete:* R$ ${session.data.freightPrice.toFixed(2).replace('.', ',')}${session.data.note ? `\n📝 *Obs:* ${session.data.note}` : ''}\n\nConfirma o pedido? Responda *SIM* para gerar o PIX.`;
+        const summary = `📦 *Resumo da entrega:*\n\n👤 *Cliente:* ${session.data.name}\n🏪 *Retirada:* ${pickupLine}\n📍 *Entrega:* ${session.data.deliveryAddress}\n📏 *Distância:* ${session.data.distanceKm} km\n💰 *Frete:* R$ ${session.data.freightPrice.toFixed(2).replace('.', ',')}${session.data.note ? `\n📝 *Obs:* ${session.data.note}` : ''}\n\nConfirma o pedido? Responda *SIM* para solicitar o motoboy.`;
         session.history.push({ role: 'assistant', content: summary });
         sessions.set(phone, session);
         await sendWhatsApp(phone, summary);
@@ -637,30 +661,13 @@ async function handleBotMessage(phone, text) {
         distanceKm:        session.data.distanceKm,
         freightPrice:      session.data.freightPrice,
         paymentId: null, requestId: null,
-        status: 'awaiting_payment',
+        status: 'pending',
         createdAt: new Date().toISOString(),
       };
       orders.set(orderId, order);
       await dbSaveOrder(order);
-      sessions.set(phone, { ...session, state: 'awaiting_payment', orderId });
-
-      await sendWhatsApp(phone, '⏳ Gerando PIX...');
-      try {
-        const { paymentId, copyPaste } = await createPixPayment(orderId, session.data.freightPrice, `Frete #${orderId}`, phone);
-        order.paymentId = paymentId;
-        paymentToOrder.set(paymentId, orderId);
-        await dbUpdateOrder(orderId, { payment_id: paymentId });
-        await sendWhatsApp(phone,
-          `💳 *PIX gerado!*\n\nValor: *R$ ${session.data.freightPrice.toFixed(2).replace('.', ',')}*\n\nCopie o código abaixo:\n\n${copyPaste}\n\n_Confirmação automática após o pagamento._\n\nPara cancelar responda *CANCELAR*.`
-        );
-      } catch (e) {
-        console.error('MP error:', e.message);
-        // Mantém o pedido no sistema (não apaga) e permite retry
-        order.status = 'pix_error';
-        await dbUpdateOrder(orderId, { status: 'pix_error' });
-        sessions.set(phone, { ...session, state: 'pix_error', orderId });
-        await sendWhatsApp(phone, `❌ Erro ao gerar o PIX: ${e.message}\n\nMande qualquer mensagem para tentar de novo.`);
-      }
+      sessions.delete(phone); // libera sessão — pedido já foi criado
+      await createRequestFromOrder(orderId);
       break;
     }
 
