@@ -1,31 +1,30 @@
 'use strict';
 
-const express = require('express');
-const http = require('http');
+const express  = require('express');
+const http     = require('http');
 const { Server } = require('socket.io');
-const cors = require('cors');
+const cors     = require('cors');
 const { v4: uuidv4 } = require('uuid');
-const path = require('path');
+const path     = require('path');
+const QRCode   = require('qrcode');
+const { Pool } = require('pg');
 
-const app = express();
+const app    = express();
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST'] } });
+const io     = new Server(server, { cors: { origin: '*', methods: ['GET', 'POST'] } });
 
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ── Config ───────────────────────────────────────────────────────────────────
-const HOST_URL     = process.env.HOST_URL
+const HOST_URL  = process.env.HOST_URL
   || (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : null)
   || `http://localhost:${process.env.PORT || 3000}`;
-const EVO_URL      = (process.env.EVOLUTION_API_URL || '').replace(/\/$/, '');
-const EVO_KEY      = process.env.EVOLUTION_API_KEY  || '';
-const EVO_INSTANCE = process.env.EVOLUTION_INSTANCE || '';
-const MP_TOKEN     = process.env.MERCADOPAGO_ACCESS_TOKEN || '';
-const ADMIN_KEY    = process.env.ADMIN_KEY || 'admin123';
+const MP_TOKEN  = process.env.MERCADOPAGO_ACCESS_TOKEN || '';
+const ADMIN_KEY = process.env.ADMIN_KEY || 'admin123';
+const DB_URL    = process.env.DATABASE_URL || '';
 
-// Tabela de frete por distância (km → R$)
 const FREIGHT_TABLE = [
   { maxKm: 3,        price: 8  },
   { maxKm: 6,        price: 12 },
@@ -34,46 +33,185 @@ const FREIGHT_TABLE = [
   { maxKm: Infinity, price: 30 },
 ];
 
-// ── In-memory stores ─────────────────────────────────────────────────────────
-const deliveries      = new Map(); // deliveryId → delivery
-const pendingRequests = new Map(); // requestId  → request
-const sessions        = new Map(); // phone      → session
-const establishments  = new Map(); // phone      → establishment
-const orders          = new Map(); // orderId    → order
-const paymentToOrder  = new Map(); // paymentId  → orderId
+// ── PostgreSQL ────────────────────────────────────────────────────────────────
+const db = DB_URL ? new Pool({ connectionString: DB_URL, ssl: { rejectUnauthorized: false } }) : null;
 
-// ── WhatsApp ─────────────────────────────────────────────────────────────────
+async function dbInit() {
+  if (!db) return;
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS wa_session (
+      key   TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS establishments (
+      phone   TEXT PRIMARY KEY,
+      name    TEXT NOT NULL,
+      address TEXT NOT NULL,
+      lat     DOUBLE PRECISION NOT NULL,
+      lng     DOUBLE PRECISION NOT NULL
+    );
+  `);
+  // Carregar estabelecimentos do banco
+  const rows = await db.query('SELECT * FROM establishments');
+  for (const r of rows.rows) {
+    establishments.set(r.phone, { name: r.name, address: r.address, lat: r.lat, lng: r.lng });
+  }
+  console.log(`\n✅ PostgreSQL conectado — ${rows.rows.length} estabelecimento(s) carregado(s)`);
+}
+
+// ── In-memory stores ─────────────────────────────────────────────────────────
+const deliveries      = new Map();
+const pendingRequests = new Map();
+const sessions        = new Map();
+const establishments  = new Map();
+const orders          = new Map();
+const paymentToOrder  = new Map();
+
+// ── WhatsApp (Baileys) ────────────────────────────────────────────────────────
+let waSocket   = null;
+let currentQR  = null;
+let waStatus   = 'disconnected'; // disconnected | qr | connecting | open
+
+async function initWhatsApp() {
+  const {
+    default: makeWASocket,
+    DisconnectReason,
+    BufferJSON,
+    initAuthCreds,
+    makeCacheableSignalKeyStore,
+    proto,
+  } = await import('@whiskeysockets/baileys');
+
+  const pino = (await import('pino')).default;
+  const logger = pino({ level: 'silent' });
+
+  // ── Auth state no PostgreSQL ────────────────────────────────────────────
+  async function read(key) {
+    if (!db) return null;
+    const r = await db.query('SELECT value FROM wa_session WHERE key=$1', [key]);
+    return r.rows[0] ? JSON.parse(r.rows[0].value, BufferJSON.reviver) : null;
+  }
+  async function write(key, data) {
+    if (!db) return;
+    const val = JSON.stringify(data, BufferJSON.replacer);
+    await db.query(
+      'INSERT INTO wa_session(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=$2',
+      [key, val]
+    );
+  }
+  async function del(key) {
+    if (!db) return;
+    await db.query('DELETE FROM wa_session WHERE key=$1', [key]);
+  }
+
+  const creds = (await read('creds')) || initAuthCreds();
+
+  const state = {
+    creds,
+    keys: makeCacheableSignalKeyStore({
+      get: async (type, ids) => {
+        const result = {};
+        await Promise.all(ids.map(async (id) => {
+          let val = await read(`${type}:${id}`);
+          if (type === 'app-state-sync-key' && val)
+            val = proto.Message.AppStateSyncKeyData.fromObject(val);
+          result[id] = val;
+        }));
+        return result;
+      },
+      set: async (data) => {
+        await Promise.all(
+          Object.entries(data).flatMap(([type, items]) =>
+            Object.entries(items).map(([id, val]) =>
+              val ? write(`${type}:${id}`, val) : del(`${type}:${id}`)
+            )
+          )
+        );
+      },
+    }, logger),
+  };
+  const saveCreds = () => write('creds', creds);
+
+  // ── Criar socket ────────────────────────────────────────────────────────
+  function connect() {
+    const sock = makeWASocket({
+      auth: state,
+      logger,
+      printQRInTerminal: true,
+      browser: ['MotoBot', 'Chrome', '120.0'],
+    });
+
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
+      if (qr) {
+        currentQR = qr;
+        waStatus  = 'qr';
+        console.log('\n📱 QR Code disponível em /qr');
+      }
+      if (connection === 'open') {
+        waSocket  = sock;
+        waStatus  = 'open';
+        currentQR = null;
+        console.log('\n✅ WhatsApp conectado!');
+      }
+      if (connection === 'close') {
+        waSocket = null;
+        waStatus = 'disconnected';
+        const code = lastDisconnect?.error?.output?.statusCode;
+        const shouldReconnect = code !== DisconnectReason.loggedOut;
+        console.log(`\n⚠️  WhatsApp desconectado (código ${code}) — ${shouldReconnect ? 'reconectando...' : 'sessão encerrada'}`);
+        if (shouldReconnect) setTimeout(connect, 5000);
+        else {
+          // Sessão expirada — limpa e reinicia para novo QR
+          if (db) await db.query('DELETE FROM wa_session');
+          setTimeout(connect, 3000);
+        }
+      }
+    });
+
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') return;
+      for (const msg of messages) {
+        if (msg.key.fromMe) continue;
+        const phone = msg.key.remoteJid?.replace('@s.whatsapp.net', '');
+        if (!phone) continue;
+        const text = msg.message?.conversation
+          || msg.message?.extendedTextMessage?.text
+          || '';
+        if (!text) continue;
+        await handleBotMessage(phone, text);
+      }
+    });
+  }
+
+  connect();
+}
+
 async function sendWhatsApp(phone, text) {
-  if (!EVO_URL || !EVO_KEY || !EVO_INSTANCE) {
-    console.log(`[WA → ${phone}] ${text.slice(0, 80)}...`);
+  if (!waSocket) {
+    console.log(`[WA OFFLINE → ${phone}] ${text.slice(0, 60)}`);
     return;
   }
   try {
-    const res = await fetch(`${EVO_URL}/message/sendText/${EVO_INSTANCE}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', apikey: EVO_KEY },
-      body: JSON.stringify({ number: phone, text }),
-    });
-    if (!res.ok) console.error('WA error:', await res.text());
-  } catch (e) { console.error('WA error:', e.message); }
+    await waSocket.sendMessage(`${phone}@s.whatsapp.net`, { text });
+  } catch (e) {
+    console.error('WA send error:', e.message);
+  }
 }
 
 // ── Geocodificação (Nominatim) ────────────────────────────────────────────────
 async function geocode(address) {
   try {
     const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(address)}&format=json&limit=1&countrycodes=br`;
-    const res  = await fetch(url, { headers: { 'User-Agent': 'DeliveryBot/1.0 (contato@seudominio.com)' } });
+    const res  = await fetch(url, { headers: { 'User-Agent': 'DeliveryBot/1.0' } });
     const data = await res.json();
     if (!data.length) return null;
-    return {
-      lat:     parseFloat(data[0].lat),
-      lng:     parseFloat(data[0].lon),
-      display: data[0].display_name,
-    };
+    return { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon), display: data[0].display_name };
   } catch { return null; }
 }
 
-// ── Distância real via OSRM ──────────────────────────────────────────────────
+// ── Distância real (OSRM) ─────────────────────────────────────────────────────
 async function getRoadDistanceKm(from, to) {
   try {
     const url = `https://router.project-osrm.org/route/v1/driving/${from.lng},${from.lat};${to.lng},${to.lat}?overview=false`;
@@ -84,7 +222,6 @@ async function getRoadDistanceKm(from, to) {
   } catch { return null; }
 }
 
-// ── Cálculo do frete ─────────────────────────────────────────────────────────
 function calcFreight(km) {
   return FREIGHT_TABLE.find(t => km <= t.maxKm).price;
 }
@@ -121,11 +258,11 @@ async function getPaymentStatus(paymentId) {
       headers: { 'Authorization': `Bearer ${MP_TOKEN}` },
     });
     const data = await res.json();
-    return data.status; // 'approved', 'pending', 'rejected', etc.
+    return data.status;
   } catch { return null; }
 }
 
-// ── Criar corrida após pagamento ─────────────────────────────────────────────
+// ── Criar corrida após pagamento confirmado ───────────────────────────────────
 async function createRequestFromOrder(orderId) {
   const order = orders.get(orderId);
   if (!order || order.requestId) return;
@@ -147,7 +284,6 @@ async function createRequestFromOrder(orderId) {
 
   order.requestId = requestId;
   order.status    = 'pending';
-
   pendingRequests.set(requestId, request);
   io.emit('new-delivery-request', request);
   console.log(`\n🚀 Corrida #${requestId} criada para ${order.establishmentName}`);
@@ -158,26 +294,20 @@ async function createRequestFromOrder(orderId) {
 }
 
 // ── Bot — máquina de estados ─────────────────────────────────────────────────
-// Estados: greeting | awaiting_delivery_address | awaiting_note | awaiting_confirm | awaiting_payment
-
 async function handleBotMessage(phone, text) {
-  const msg   = text.trim();
-  const lower = msg.toLowerCase();
+  const msg = text.trim();
 
   const estab = establishments.get(phone);
   if (!estab) {
-    await sendWhatsApp(phone,
-      '❌ Número não cadastrado em nossa plataforma.\nPeça ao administrador para cadastrar seu estabelecimento.'
-    );
+    await sendWhatsApp(phone, '❌ Número não cadastrado. Fale com o administrador para cadastrar seu estabelecimento.');
     return;
   }
 
   let session = sessions.get(phone) || { state: 'greeting' };
 
-  // Comando global: cancelar pedido em andamento
   if (/^cancelar$/i.test(msg) && session.state !== 'awaiting_payment') {
     sessions.delete(phone);
-    await sendWhatsApp(phone, '❌ Atendimento cancelado. Quando quiser, é só mandar uma mensagem!');
+    await sendWhatsApp(phone, '❌ Pedido cancelado. Quando precisar, é só chamar! 😊');
     return;
   }
 
@@ -193,38 +323,25 @@ async function handleBotMessage(phone, text) {
 
     case 'awaiting_delivery_address': {
       await sendWhatsApp(phone, '⏳ Calculando distância e frete...');
-
       const destCoords = await geocode(msg);
       if (!destCoords) {
-        await sendWhatsApp(phone,
-          '❌ Não consegui encontrar esse endereço. Tente ser mais específico (rua, número, cidade):'
-        );
+        await sendWhatsApp(phone, '❌ Endereço não encontrado. Tente ser mais específico (rua, número, cidade):');
         return;
       }
-
-      const distKm = await getRoadDistanceKm(
-        { lat: estab.lat, lng: estab.lng },
-        destCoords
-      );
+      const distKm = await getRoadDistanceKm({ lat: estab.lat, lng: estab.lng }, destCoords);
       if (!distKm) {
-        await sendWhatsApp(phone,
-          '❌ Erro ao calcular a rota. Tente informar o endereço novamente:'
-        );
+        await sendWhatsApp(phone, '❌ Não consegui calcular a rota. Tente novamente:');
         return;
       }
-
       const freight = calcFreight(distKm);
-
       session.deliveryAddress = msg;
-      session.deliveryDisplay = destCoords.display;
       session.deliveryCoords  = destCoords;
       session.distanceKm      = Math.round(distKm * 10) / 10;
       session.freightPrice    = freight;
       session.state           = 'awaiting_note';
       sessions.set(phone, session);
-
       await sendWhatsApp(phone,
-        `📦 *Resumo da entrega:*\n\n🏪 Retirada: ${estab.address}\n📍 Entrega: ${msg}\n📏 Distância: ${session.distanceKm} km\n💰 Frete: *R$ ${freight.toFixed(2).replace('.', ',')}*\n\nTem alguma observação para o motoboy? (ou responda *não*)`
+        `📦 *Resumo:*\n\n🏪 Retirada: ${estab.address}\n📍 Entrega: ${msg}\n📏 Distância: ${session.distanceKm} km\n💰 Frete: *R$ ${freight.toFixed(2).replace('.', ',')}*\n\nTem alguma observação para o motoboy? (ou responda *não*)`
       );
       break;
     }
@@ -233,10 +350,8 @@ async function handleBotMessage(phone, text) {
       session.note  = /^n[ãa]o$/i.test(msg) ? '' : msg;
       session.state = 'awaiting_confirm';
       sessions.set(phone, session);
-
-      const noteText = session.note ? `\n📝 Obs: ${session.note}` : '';
       await sendWhatsApp(phone,
-        `Confirme seu pedido:\n\n🏪 *Retirada:* ${estab.address}\n📍 *Entrega:* ${session.deliveryAddress}\n📏 *Distância:* ${session.distanceKm} km\n💰 *Frete:* R$ ${session.freightPrice.toFixed(2).replace('.', ',')}${noteText}\n\nResponda *SIM* para gerar o PIX ou *NÃO* para cancelar.`
+        `Confirme seu pedido:\n\n🏪 *Retirada:* ${estab.address}\n📍 *Entrega:* ${session.deliveryAddress}\n📏 *Distância:* ${session.distanceKm} km\n💰 *Frete:* R$ ${session.freightPrice.toFixed(2).replace('.', ',')}${session.note ? `\n📝 *Obs:* ${session.note}` : ''}\n\nResponda *SIM* para gerar o PIX ou *NÃO* para cancelar.`
       );
       break;
 
@@ -244,48 +359,37 @@ async function handleBotMessage(phone, text) {
       if (/^sim$/i.test(msg)) {
         const orderId = uuidv4().slice(0, 8).toUpperCase();
         const order = {
-          orderId,
-          phone,
+          orderId, phone,
           establishmentName: estab.name,
-          pickupAddress:  estab.address,
-          pickupCoords:   { lat: estab.lat, lng: estab.lng },
+          pickupAddress: estab.address,
+          pickupCoords:  { lat: estab.lat, lng: estab.lng },
           deliveryAddress: session.deliveryAddress,
           deliveryCoords:  session.deliveryCoords,
-          note:           session.note || '',
-          distanceKm:     session.distanceKm,
-          freightPrice:   session.freightPrice,
-          paymentId:      null,
-          requestId:      null,
-          status:         'awaiting_payment',
-          createdAt:      new Date().toISOString(),
+          note:            session.note || '',
+          distanceKm:      session.distanceKm,
+          freightPrice:    session.freightPrice,
+          paymentId: null, requestId: null,
+          status: 'awaiting_payment',
+          createdAt: new Date().toISOString(),
         };
         orders.set(orderId, order);
         sessions.delete(phone);
-
         await sendWhatsApp(phone, '⏳ Gerando PIX...');
-
         try {
           const { paymentId, copyPaste } = await createPixPayment(
-            orderId,
-            session.freightPrice,
-            `Frete entrega #${orderId} — ${estab.name}`,
-            phone
+            orderId, session.freightPrice,
+            `Frete entrega #${orderId} — ${estab.name}`, phone
           );
           order.paymentId = paymentId;
-          order.status    = 'awaiting_payment';
           paymentToOrder.set(paymentId, orderId);
-
           sessions.set(phone, { state: 'awaiting_payment', orderId });
-
           await sendWhatsApp(phone,
-            `💳 *PIX gerado!* Valor: *R$ ${session.freightPrice.toFixed(2).replace('.', ',')}*\n\nCopie o código abaixo e cole no seu app de pagamento:\n\n\`\`\`${copyPaste}\`\`\`\n\n_Após o pagamento, a confirmação é automática._\n\nSe quiser cancelar, responda *CANCELAR*.`
+            `💳 *PIX gerado!*\n\nValor: *R$ ${session.freightPrice.toFixed(2).replace('.', ',')}*\n\nCopie o código abaixo:\n\n${copyPaste}\n\n_Confirmação automática após o pagamento._\n\nPara cancelar, responda *CANCELAR*.`
           );
         } catch (e) {
           console.error('MP error:', e.message);
           orders.delete(orderId);
-          await sendWhatsApp(phone,
-            '❌ Erro ao gerar o PIX. Tente novamente em instantes.'
-          );
+          await sendWhatsApp(phone, '❌ Erro ao gerar o PIX. Tente novamente em instantes.');
         }
       } else {
         sessions.delete(phone);
@@ -294,22 +398,12 @@ async function handleBotMessage(phone, text) {
       break;
 
     case 'awaiting_payment':
-      if (/^cancelar$/i.test(msg)) {
-        const { orderId } = session;
-        const order = orders.get(orderId);
-        if (order) order.status = 'cancelled';
-        sessions.delete(phone);
-        await sendWhatsApp(phone, '❌ Pedido cancelado. Quando precisar, é só chamar! 😊');
-      } else {
-        await sendWhatsApp(phone,
-          '⏳ Aguardando confirmação do pagamento PIX...\n\nSe quiser cancelar, responda *CANCELAR*.'
-        );
-      }
+      await sendWhatsApp(phone, '⏳ Aguardando confirmação do pagamento PIX...\n\nPara cancelar, responda *CANCELAR*.');
       break;
   }
 }
 
-// ── Helpers de mapa / localização ────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 function interpolatePoints(from, to, steps = 5) {
   const pts = [];
   for (let i = 1; i <= steps; i++) {
@@ -327,41 +421,56 @@ function emitInterpolated(deliveryId, points, stepMs = 280) {
   });
 }
 
-// ── Routes — Admin ────────────────────────────────────────────────────────────
+// ── Admin ─────────────────────────────────────────────────────────────────────
 function requireAdmin(req, res, next) {
   if (req.headers['x-admin-key'] !== ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
   next();
 }
 
-// Cadastrar estabelecimento
 app.post('/admin/establishment', requireAdmin, async (req, res) => {
   const { phone, name, address } = req.body;
   if (!phone || !name || !address)
     return res.status(400).json({ error: 'phone, name e address são obrigatórios' });
 
   const coords = await geocode(address);
-  if (!coords)
-    return res.status(400).json({ error: 'Endereço não encontrado. Tente ser mais específico.' });
+  if (!coords) return res.status(400).json({ error: 'Endereço não encontrado.' });
 
-  establishments.set(String(phone), { name, address, lat: coords.lat, lng: coords.lng });
+  const estab = { name, address, lat: coords.lat, lng: coords.lng };
+  establishments.set(String(phone), estab);
+
+  if (db) {
+    await db.query(
+      'INSERT INTO establishments(phone,name,address,lat,lng) VALUES($1,$2,$3,$4,$5) ON CONFLICT(phone) DO UPDATE SET name=$2,address=$3,lat=$4,lng=$5',
+      [String(phone), name, address, coords.lat, coords.lng]
+    );
+  }
   console.log(`\n🏪 Estabelecimento cadastrado: ${name} (${phone})`);
   res.json({ ok: true, name, address, coords: { lat: coords.lat, lng: coords.lng } });
 });
 
-// Listar estabelecimentos
 app.get('/admin/establishments', requireAdmin, (_req, res) => {
-  const list = [...establishments.entries()].map(([phone, e]) => ({ phone, ...e }));
-  res.json(list);
+  res.json([...establishments.entries()].map(([phone, e]) => ({ phone, ...e })));
 });
 
-// Listar pedidos
 app.get('/admin/orders', requireAdmin, (_req, res) => {
-  const list = [...orders.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-  res.json(list);
+  res.json([...orders.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt)));
 });
 
-// Tabela de frete (leitura)
-app.get('/admin/freight-table', requireAdmin, (_req, res) => res.json(FREIGHT_TABLE));
+app.get('/admin/whatsapp', requireAdmin, (_req, res) => {
+  res.json({ status: waStatus });
+});
+
+// ── QR Code ───────────────────────────────────────────────────────────────────
+app.get('/qr', async (req, res) => {
+  if (waStatus === 'open') {
+    return res.send('<h2 style="font-family:sans-serif;color:green">✅ WhatsApp conectado!</h2>');
+  }
+  if (!currentQR) {
+    return res.send(`<html><head><meta http-equiv="refresh" content="5"><style>body{font-family:sans-serif;text-align:center;padding:40px}</style></head><body><h2>⏳ Aguardando QR Code...</h2><p>Esta página atualiza automaticamente.</p></body></html>`);
+  }
+  const qrImage = await QRCode.toDataURL(currentQR);
+  res.send(`<html><head><meta http-equiv="refresh" content="30"><style>body{font-family:sans-serif;text-align:center;padding:40px}</style></head><body><h2>📱 Escaneie com o WhatsApp</h2><img src="${qrImage}" style="max-width:300px"><p>Abra o WhatsApp → <b>Dispositivos conectados</b> → <b>Conectar dispositivo</b></p><p><small>Esta página atualiza automaticamente.</small></p></body></html>`);
+});
 
 // ── Routes — Entrega ──────────────────────────────────────────────────────────
 app.post('/request-delivery', (req, res) => {
@@ -370,7 +479,6 @@ app.post('/request-delivery', (req, res) => {
   const request = { requestId, customerName, address, phone, note, status: 'pending', createdAt: new Date().toISOString() };
   pendingRequests.set(requestId, request);
   io.emit('new-delivery-request', request);
-  console.log(`\n📱 Nova solicitação manual #${requestId} de "${customerName}"`);
   res.json({ requestId, message: 'Pedido enviado para motoboys disponíveis' });
 });
 
@@ -378,7 +486,6 @@ app.post('/update-location', (req, res) => {
   const { deliveryId, lat, lng } = req.body;
   if (!deliveryId || lat == null || lng == null)
     return res.status(400).json({ error: 'Campos obrigatórios: deliveryId, lat, lng' });
-
   const newPos = { lat: parseFloat(lat), lng: parseFloat(lng) };
   let delivery = deliveries.get(deliveryId);
   if (!delivery) {
@@ -401,64 +508,29 @@ app.get('/delivery/:deliveryId', (req, res) => {
   res.json({ lastPosition: d.lastPosition, status: d.status });
 });
 
-// ── Webhook — Mercado Pago ────────────────────────────────────────────────────
+// ── Webhook Mercado Pago ──────────────────────────────────────────────────────
 app.post('/webhook/mercadopago', async (req, res) => {
   res.sendStatus(200);
   const { type, data } = req.body;
   if (type !== 'payment' || !data?.id) return;
-
   const paymentId = String(data.id);
   const status    = await getPaymentStatus(paymentId);
-  console.log(`\n💳 MP webhook — payment ${paymentId}: ${status}`);
-
+  console.log(`\n💳 MP payment ${paymentId}: ${status}`);
   if (status !== 'approved') return;
-
   const orderId = paymentToOrder.get(paymentId);
   if (!orderId) return;
-
   const order = orders.get(orderId);
   if (!order || order.status !== 'awaiting_payment') return;
-
   order.status = 'paid';
   await createRequestFromOrder(orderId);
 });
 
-// ── Webhook — Evolution API ───────────────────────────────────────────────────
-app.post('/webhook/whatsapp', async (req, res) => {
-  res.sendStatus(200);
-  const body  = req.body;
-  const event = body.event || body.type || '';
+app.get('/health', (_req, res) => res.json({ ok: true, uptime: process.uptime(), whatsapp: waStatus }));
 
-  const isMessage = event === 'messages.upsert' || event === 'message' || !!body.data?.message;
-  if (!isMessage) return;
-
-  const fromMe = body.data?.key?.fromMe || body.key?.fromMe || false;
-  if (fromMe) return;
-
-  const msg = (
-    body.data?.message?.conversation ||
-    body.data?.message?.extendedTextMessage?.text ||
-    body.message?.conversation || ''
-  ).trim();
-
-  const phone = (body.data?.key?.remoteJid || body.key?.remoteJid || '').replace('@s.whatsapp.net', '');
-  if (!msg || !phone) return;
-
-  await handleBotMessage(phone, msg);
-});
-
-app.get('/health', (_req, res) => res.json({ ok: true, uptime: process.uptime() }));
-
-// Keep-alive: impede o Render de hibernar o serviço no plano gratuito
-if (process.env.NODE_ENV === 'production') {
-  setInterval(() => {
-    fetch(`${HOST_URL}/health`).catch(() => {});
-  }, 14 * 60 * 1000); // ping a cada 14 minutos
-}
 app.get('/track/:deliveryId', (_req, res) =>
   res.sendFile(path.join(__dirname, 'public', 'track.html')));
 
-// ── Socket.io ────────────────────────────────────────────────────────────────
+// ── Socket.io ─────────────────────────────────────────────────────────────────
 io.on('connection', (socket) => {
   socket.on('join-delivery', (rawId) => {
     const deliveryId = String(rawId).toUpperCase();
@@ -474,27 +546,17 @@ io.on('connection', (socket) => {
     if (!request || request.status !== 'pending') {
       socket.emit('request-unavailable', { requestId }); return;
     }
-
     request.status = 'accepted';
     const deliveryId  = uuidv4().slice(0, 8).toUpperCase();
     const trackingUrl = `${HOST_URL}/track/${deliveryId}`;
-
-    deliveries.set(deliveryId, {
-      lastPosition: null, history: [], status: 'active',
-      phone: request.phone, createdAt: new Date().toISOString(),
-    });
-
-    // Atualiza status do pedido
+    deliveries.set(deliveryId, { lastPosition: null, history: [], status: 'active', phone: request.phone, createdAt: new Date().toISOString() });
     if (request.orderId) {
       const order = orders.get(request.orderId);
       if (order) { order.status = 'delivering'; order.deliveryId = deliveryId; }
     }
-
     socket.emit('delivery-assigned', { deliveryId, trackingUrl });
     socket.broadcast.emit('request-taken', { requestId });
     console.log(`\n✅ Corrida #${requestId} aceita → Entrega #${deliveryId}`);
-
-    // Envia link de rastreio pro cliente
     if (request.phone) {
       await sendWhatsApp(request.phone,
         `🛵 *Motoboy a caminho!*\n\nAcompanhe sua entrega em tempo real:\n${trackingUrl}\n\n_A página atualiza automaticamente._`
@@ -516,18 +578,23 @@ io.on('connection', (socket) => {
   });
 });
 
+// ── Keep-alive (Render free tier) ─────────────────────────────────────────────
+if (process.env.NODE_ENV === 'production') {
+  setInterval(() => fetch(`${HOST_URL}/health`).catch(() => {}), 14 * 60 * 1000);
+}
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
   console.log('\n╔══════════════════════════════════════════════════════════╗');
-  console.log('║   🚚  Delivery Tracker — servidor iniciado               ║');
+  console.log('║   🚚  Delivery Tracker                                   ║');
+  console.log(`║   ${HOST_URL.padEnd(54)}║`);
   console.log('╠══════════════════════════════════════════════════════════╣');
-  console.log(`║  URL:          ${HOST_URL.padEnd(41)}║`);
-  console.log(`║  WhatsApp:     POST /webhook/whatsapp                    ║`);
-  console.log(`║  Mercado Pago: POST /webhook/mercadopago                 ║`);
-  console.log(`║  Admin:        POST /admin/establishment (x-admin-key)   ║`);
-  console.log('╚══════════════════════════════════════════════════════════╝');
-  if (!MP_TOKEN)  console.log('\n⚠️  MERCADOPAGO_ACCESS_TOKEN não configurado — PIX desativado');
-  if (!EVO_URL)   console.log('⚠️  EVOLUTION_API_URL não configurado — WhatsApp desativado');
-  console.log('');
+  console.log('║  QR Code:   /qr                                          ║');
+  console.log('║  Admin:     /admin/establishment  (x-admin-key)          ║');
+  console.log('║  MP Webhook: /webhook/mercadopago                        ║');
+  console.log('╚══════════════════════════════════════════════════════════╝\n');
+  if (!MP_TOKEN) console.log('⚠️  MERCADOPAGO_ACCESS_TOKEN não configurado');
+  await dbInit();
+  await initWhatsApp();
 });
