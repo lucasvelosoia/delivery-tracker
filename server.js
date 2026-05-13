@@ -250,7 +250,11 @@ async function connectWA() {
         if (fromMe) continue;
         if (jid.endsWith('@g.us')) continue;
         if (type !== 'notify') continue;
-        if (jid && text) await handleBotMessage(jid, text); // usa JID completo
+        if (!jid || !text) continue;
+        handleBotMessage(jid, text).catch(async (e) => {
+          console.error('Bot error:', e.message);
+          await sendWhatsApp(jid, '⚠️ Erro interno. Tente novamente em instantes.').catch(() => {});
+        });
       }
     });
   } catch (e) {
@@ -259,6 +263,12 @@ async function connectWA() {
     waReconnecting = false;
     setTimeout(connectWA, 10000);
   }
+}
+
+function fetchWithTimeout(url, options = {}, ms = 12000) {
+  const ctrl = new AbortController();
+  const id   = setTimeout(() => ctrl.abort(), ms);
+  return fetch(url, { ...options, signal: ctrl.signal }).finally(() => clearTimeout(id));
 }
 
 async function sendWhatsApp(phoneOrJid, text) {
@@ -283,9 +293,10 @@ async function geocode(address) {
 
   for (const q of variants) {
     try {
-      const res  = await fetch(
+      const res  = await fetchWithTimeout(
         `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=1&countrycodes=br`,
-        { headers: { 'User-Agent': 'ZAPEntregas/1.0' } }
+        { headers: { 'User-Agent': 'ZAPEntregas/1.0' } },
+        8000
       );
       const data = await res.json();
       if (data.length) return { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon), display: data[0].display_name };
@@ -298,7 +309,10 @@ async function geocode(address) {
 
 async function getRoadDistanceKm(from, to) {
   try {
-    const res  = await fetch(`https://router.project-osrm.org/route/v1/driving/${from.lng},${from.lat};${to.lng},${to.lat}?overview=false`);
+    const res  = await fetchWithTimeout(
+      `https://router.project-osrm.org/route/v1/driving/${from.lng},${from.lat};${to.lng},${to.lat}?overview=false`,
+      {}, 8000
+    );
     const data = await res.json();
     return data.code === 'Ok' ? data.routes[0].distance / 1000 : null;
   } catch { return null; }
@@ -393,17 +407,21 @@ Responda SOMENTE com JSON válido neste formato:
 }`;
 
 async function callGroq(messages) {
-  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GROQ_KEY}` },
-    body: JSON.stringify({
-      model: 'llama-3.3-70b-versatile',
-      messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...messages],
-      response_format: { type: 'json_object' },
-      temperature: 0.3,
-      max_tokens: 600,
-    }),
-  });
+  const res = await fetchWithTimeout(
+    'https://api.groq.com/openai/v1/chat/completions',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GROQ_KEY}` },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...messages],
+        response_format: { type: 'json_object' },
+        temperature: 0.3,
+        max_tokens: 600,
+      }),
+    },
+    25000 // Groq raramente demora mais que 10s, mas damos 25s de margem
+  );
   const json = await res.json();
   if (!res.ok) throw new Error(json.error?.message || 'Groq error');
   return JSON.parse(json.choices[0].message.content);
