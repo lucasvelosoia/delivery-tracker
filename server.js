@@ -59,6 +59,20 @@ async function dbInit() {
       pickup_lat     DOUBLE PRECISION NOT NULL,
       pickup_lng     DOUBLE PRECISION NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS pedidos (
+      order_id         TEXT PRIMARY KEY,
+      phone            TEXT,
+      customer_name    TEXT,
+      pickup_address   TEXT,
+      delivery_address TEXT,
+      distance_km      REAL,
+      freight_price    REAL,
+      status           TEXT DEFAULT 'awaiting_payment',
+      payment_id       TEXT,
+      request_id       TEXT,
+      note             TEXT,
+      created_at       TIMESTAMPTZ DEFAULT NOW()
+    );
   `);
   const rows = await db.query('SELECT * FROM establishments');
   for (const r of rows.rows)
@@ -66,8 +80,28 @@ async function dbInit() {
   const clientRows = await db.query('SELECT * FROM clients');
   for (const r of clientRows.rows)
     clients.set(r.phone, { name: r.name, pickupAddress: r.pickup_address, pickupCoords: { lat: r.pickup_lat, lng: r.pickup_lng } });
-  console.log(`✅ PostgreSQL conectado — ${rows.rows.length} estabelecimento(s), ${clientRows.rows.length} cliente(s) recorrente(s)`);
+  const orderRows = await db.query('SELECT * FROM pedidos ORDER BY created_at DESC LIMIT 500');
+  for (const r of orderRows.rows)
+    orders.set(r.order_id, { orderId: r.order_id, phone: r.phone, establishmentName: r.customer_name, pickupAddress: r.pickup_address, deliveryAddress: r.delivery_address, distanceKm: r.distance_km, freightPrice: r.freight_price, status: r.status, paymentId: r.payment_id, requestId: r.request_id, note: r.note, createdAt: r.created_at?.toISOString?.() || r.created_at });
+  console.log(`✅ PostgreSQL conectado — ${rows.rows.length} estabelecimento(s), ${clientRows.rows.length} cliente(s), ${orderRows.rows.length} pedido(s)`);
 }
+
+const dbSaveOrder = (o) => {
+  if (!db) return Promise.resolve();
+  return db.query(
+    `INSERT INTO pedidos(order_id,phone,customer_name,pickup_address,delivery_address,distance_km,freight_price,status,note)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(order_id) DO NOTHING`,
+    [o.orderId, o.phone, o.establishmentName, o.pickupAddress, o.deliveryAddress, o.distanceKm, o.freightPrice, o.status, o.note]
+  ).catch(e => console.error('dbSaveOrder:', e.message));
+};
+
+const dbUpdateOrder = (orderId, fields) => {
+  if (!db) return Promise.resolve();
+  const entries = Object.entries(fields);
+  const sets    = entries.map(([k, _], i) => `${k}=$${i + 2}`).join(',');
+  return db.query(`UPDATE pedidos SET ${sets} WHERE order_id=$1`, [orderId, ...entries.map(([_, v]) => v)])
+    .catch(e => console.error('dbUpdateOrder:', e.message));
+};
 
 async function saveClient(phone, name, pickupAddress, pickupCoords) {
   clients.set(phone, { name, pickupAddress, pickupCoords });
@@ -282,6 +316,7 @@ async function createRequestFromOrder(orderId) {
   pendingRequests.set(requestId, request);
   io.emit('new-delivery-request', request);
   console.log(`🚀 Corrida #${requestId} criada — ${order.establishmentName}`);
+  await dbUpdateOrder(orderId, { status: 'pending', request_id: requestId });
   if (order.phone && order.establishmentName && order.pickupAddress && order.pickupCoords)
     await saveClient(order.phone, order.establishmentName, order.pickupAddress, order.pickupCoords);
   await sendWhatsApp(order.phone, `✅ *Pagamento confirmado!*\n\nSeu pedido *#${orderId}* está na fila.\n🛵 Localizando o motoboy mais próximo...`);
@@ -444,7 +479,6 @@ async function handleBotMessage(phone, text) {
   switch (aiReply.action) {
 
     case 'calculate_freight': {
-      await sendWhatsApp(phone, aiReply.message);
       await sendWhatsApp(phone, '⏳ Calculando distância e frete...');
 
       // Clientes recorrentes já têm coords de retirada; novos precisam geocodificar
@@ -508,6 +542,7 @@ async function handleBotMessage(phone, text) {
         createdAt: new Date().toISOString(),
       };
       orders.set(orderId, order);
+      await dbSaveOrder(order);
       sessions.set(phone, { ...session, state: 'awaiting_payment', orderId });
 
       await sendWhatsApp(phone, '⏳ Gerando PIX...');
@@ -515,6 +550,7 @@ async function handleBotMessage(phone, text) {
         const { paymentId, copyPaste } = await createPixPayment(orderId, session.data.freightPrice, `Frete #${orderId}`, phone);
         order.paymentId = paymentId;
         paymentToOrder.set(paymentId, orderId);
+        await dbUpdateOrder(orderId, { payment_id: paymentId });
         await sendWhatsApp(phone,
           `💳 *PIX gerado!*\n\nValor: *R$ ${session.data.freightPrice.toFixed(2).replace('.', ',')}*\n\nCopie o código abaixo:\n\n${copyPaste}\n\n_Confirmação automática após o pagamento._\n\nPara cancelar responda *CANCELAR*.`
         );
@@ -550,9 +586,87 @@ function emitInterpolated(deliveryId, points, ms = 280) {
 
 // ── Admin ─────────────────────────────────────────────────────────────────────
 function requireAdmin(req, res, next) {
-  if (req.headers['x-admin-key'] !== ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  const key = req.headers['x-admin-key'] || req.query.key;
+  if (key !== ADMIN_KEY) return res.status(401).json({ error: 'Unauthorized' });
   next();
 }
+
+const STATUS_LABEL = { awaiting_payment: '⏳ Aguardando PIX', paid: '💳 Pago', pending: '🔍 Aguardando motoboy', delivering: '🛵 Em entrega', cancelled: '❌ Cancelado', completed: '✅ Concluído' };
+const STATUS_CSS   = { awaiting_payment: 'yellow', paid: 'blue', pending: 'orange', delivering: 'green', cancelled: 'red', completed: 'darkgreen' };
+
+app.get('/painel', (req, res) => {
+  const key = req.headers['x-admin-key'] || req.query.key;
+  if (key !== ADMIN_KEY) return res.send(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>ZAP Entregas</title><style>body{font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;background:#f0f2f5}form{background:#fff;padding:32px;border-radius:12px;box-shadow:0 2px 8px rgba(0,0,0,.12);text-align:center}h2{margin:0 0 16px}input{padding:10px 14px;border:1px solid #ddd;border-radius:8px;width:220px;font-size:14px}button{display:block;width:100%;margin-top:12px;padding:10px;background:#25D366;color:#fff;border:none;border-radius:8px;font-size:14px;cursor:pointer}</style></head><body><form method="GET"><h2>🛵 ZAP Entregas</h2><input name="key" type="password" placeholder="Chave de admin" required><button type="submit">Entrar</button></form></body></html>`);
+
+  const all  = [...orders.values()].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  const stats = {
+    total:      all.length,
+    aguardando: all.filter(o => o.status === 'awaiting_payment').length,
+    entrega:    all.filter(o => o.status === 'delivering').length,
+    cancelados: all.filter(o => o.status === 'cancelled').length,
+  };
+
+  const fmt = (v) => v ? `R$ ${Number(v).toFixed(2).replace('.', ',')}` : '—';
+  const dt  = (s) => s ? new Date(s).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—';
+
+  const rows = all.map(o => `<tr>
+    <td><strong>#${o.orderId}</strong><br><small>${dt(o.createdAt)}</small></td>
+    <td>${o.establishmentName || '—'}<br><small>${o.phone || ''}</small></td>
+    <td class="addr">${o.pickupAddress || '—'}</td>
+    <td class="addr">${o.deliveryAddress || '—'}</td>
+    <td>${o.distanceKm ? o.distanceKm + ' km' : '—'}</td>
+    <td>${fmt(o.freightPrice)}</td>
+    <td><span class="badge s-${STATUS_CSS[o.status] || 'gray'}">${STATUS_LABEL[o.status] || o.status}</span></td>
+  </tr>`).join('');
+
+  res.send(`<!DOCTYPE html>
+<html lang="pt-BR"><head><meta charset="UTF-8">
+<meta http-equiv="refresh" content="15;url=/painel?key=${encodeURIComponent(key)}">
+<title>ZAP Entregas — Painel</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,sans-serif;background:#f0f2f5}
+header{background:#25D366;color:#fff;padding:14px 24px;display:flex;justify-content:space-between;align-items:center}
+header h1{font-size:1rem;font-weight:700}
+header small{opacity:.8;font-size:.78rem}
+.stats{display:flex;gap:12px;padding:20px 24px;flex-wrap:wrap}
+.stat{background:#fff;border-radius:10px;padding:14px 20px;box-shadow:0 1px 3px rgba(0,0,0,.1);min-width:130px}
+.stat .n{font-size:2rem;font-weight:700;line-height:1}
+.stat .l{font-size:.75rem;color:#666;margin-top:4px}
+.wrap{padding:0 24px 32px;overflow-x:auto}
+table{width:100%;border-collapse:collapse;background:#fff;border-radius:10px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+th{padding:10px 14px;text-align:left;font-size:.72rem;color:#777;background:#fafafa;border-bottom:1px solid #eee;text-transform:uppercase;letter-spacing:.04em}
+td{padding:10px 14px;border-top:1px solid #f0f0f0;font-size:.83rem;vertical-align:top}
+.addr{max-width:160px;word-break:break-word}
+small{color:#aaa;font-size:.73rem}
+.badge{display:inline-block;padding:3px 9px;border-radius:20px;font-size:.72rem;font-weight:600}
+.s-yellow{background:#fff3cd;color:#856404}
+.s-blue{background:#cfe2ff;color:#0d47a1}
+.s-orange{background:#ffe5d0;color:#9c4a0a}
+.s-green{background:#d1fae5;color:#065f46}
+.s-red{background:#fee2e2;color:#991b1b}
+.s-darkgreen{background:#bbf7d0;color:#14532d}
+.empty{text-align:center;color:#bbb;padding:40px!important}
+</style></head><body>
+<header>
+  <h1>🛵 ZAP Entregas — Painel de Pedidos</h1>
+  <small>Atualiza a cada 15s · ${new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })}</small>
+</header>
+<div class="stats">
+  <div class="stat"><div class="n">${stats.total}</div><div class="l">Total de pedidos</div></div>
+  <div class="stat"><div class="n">${stats.aguardando}</div><div class="l">Aguardando PIX</div></div>
+  <div class="stat"><div class="n">${stats.entrega}</div><div class="l">Em entrega</div></div>
+  <div class="stat"><div class="n">${stats.cancelados}</div><div class="l">Cancelados</div></div>
+</div>
+<div class="wrap">
+<table><thead><tr>
+  <th>Pedido</th><th>Cliente</th><th>Retirada</th><th>Entrega</th><th>Distância</th><th>Frete</th><th>Status</th>
+</tr></thead><tbody>
+${rows || '<tr><td colspan="7" class="empty">Nenhum pedido ainda</td></tr>'}
+</tbody></table>
+</div>
+</body></html>`);
+});
 
 app.post('/admin/establishment', requireAdmin, async (req, res) => {
   const { phone, name, address } = req.body;
@@ -624,6 +738,7 @@ app.post('/webhook/mercadopago', async (req, res) => {
   const order = orders.get(orderId);
   if (!order || order.status !== 'awaiting_payment') return;
   order.status = 'paid';
+  await dbUpdateOrder(orderId, { status: 'paid' });
   await createRequestFromOrder(orderId);
 });
 
@@ -657,7 +772,7 @@ io.on('connection', (socket) => {
     const deliveryId  = uuidv4().slice(0, 8).toUpperCase();
     const trackingUrl = `${HOST_URL}/track/${deliveryId}`;
     deliveries.set(deliveryId, { lastPosition: null, history: [], status: 'active', phone: request.phone, createdAt: new Date().toISOString() });
-    if (request.orderId) { const o = orders.get(request.orderId); if (o) { o.status = 'delivering'; o.deliveryId = deliveryId; } }
+    if (request.orderId) { const o = orders.get(request.orderId); if (o) { o.status = 'delivering'; o.deliveryId = deliveryId; dbUpdateOrder(request.orderId, { status: 'delivering' }); } }
     socket.emit('delivery-assigned', { deliveryId, trackingUrl });
     socket.broadcast.emit('request-taken', { requestId });
     console.log(`✅ Corrida #${requestId} → Entrega #${deliveryId}`);
