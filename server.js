@@ -196,13 +196,7 @@ async function createRequestFromOrder(orderId) {
 
 // ── Bot ───────────────────────────────────────────────────────────────────────
 async function handleBotMessage(phone, text) {
-  const msg   = text.trim();
-  const estab = establishments.get(phone);
-
-  if (!estab) {
-    await sendWhatsApp(phone, '❌ Número não cadastrado. Fale com o administrador para cadastrar seu estabelecimento.');
-    return;
-  }
+  const msg = text.trim();
 
   let session = sessions.get(phone) || { state: 'greeting' };
 
@@ -215,20 +209,47 @@ async function handleBotMessage(phone, text) {
   switch (session.state) {
     case 'greeting':
     default:
-      sessions.set(phone, { state: 'awaiting_delivery_address' });
-      await sendWhatsApp(phone, `👋 Olá, *${estab.name}*!\n\n📍 *Retirada:* ${estab.address}\n\nPara qual endereço é a entrega?`);
+      sessions.set(phone, { state: 'awaiting_name' });
+      await sendWhatsApp(phone,
+        '👋 Olá! Bem-vindo ao serviço de entregas. 🛵\n\nQual é o seu *nome*?'
+      );
       break;
+
+    case 'awaiting_name':
+      sessions.set(phone, { state: 'awaiting_pickup_address', name: msg });
+      await sendWhatsApp(phone,
+        `Olá, *${msg}*! 😊\n\nQual é o endereço de *retirada*? (onde o motoboy vai buscar)`
+      );
+      break;
+
+    case 'awaiting_pickup_address': {
+      await sendWhatsApp(phone, '⏳ Verificando endereço de retirada...');
+      const pickup = await geocode(msg);
+      if (!pickup) { await sendWhatsApp(phone, '❌ Endereço não encontrado. Tente com rua, número e cidade:'); return; }
+      session.pickupAddress = msg;
+      session.pickupCoords  = pickup;
+      session.state         = 'awaiting_delivery_address';
+      sessions.set(phone, session);
+      await sendWhatsApp(phone, `✅ Retirada: *${msg}*\n\nAgora qual é o endereço de *entrega*?`);
+      break;
+    }
 
     case 'awaiting_delivery_address': {
       await sendWhatsApp(phone, '⏳ Calculando distância e frete...');
       const dest = await geocode(msg);
       if (!dest) { await sendWhatsApp(phone, '❌ Endereço não encontrado. Tente com rua, número e cidade:'); return; }
-      const km = await getRoadDistanceKm({ lat: estab.lat, lng: estab.lng }, dest);
-      if (!km) { await sendWhatsApp(phone, '❌ Não consegui calcular a rota. Tente novamente:'); return; }
+      const km = await getRoadDistanceKm(session.pickupCoords, dest);
+      if (!km)   { await sendWhatsApp(phone, '❌ Não consegui calcular a rota. Tente novamente:'); return; }
       const freight = calcFreight(km);
-      session = { state: 'awaiting_note', deliveryAddress: msg, deliveryCoords: dest, distanceKm: Math.round(km * 10) / 10, freightPrice: freight };
+      session.deliveryAddress = msg;
+      session.deliveryCoords  = dest;
+      session.distanceKm      = Math.round(km * 10) / 10;
+      session.freightPrice    = freight;
+      session.state           = 'awaiting_note';
       sessions.set(phone, session);
-      await sendWhatsApp(phone, `📦 *Resumo:*\n\n🏪 Retirada: ${estab.address}\n📍 Entrega: ${msg}\n📏 Distância: ${session.distanceKm} km\n💰 Frete: *R$ ${freight.toFixed(2).replace('.', ',')}*\n\nAlguma observação para o motoboy? (ou responda *não*)`);
+      await sendWhatsApp(phone,
+        `📦 *Resumo da entrega:*\n\n🏪 Retirada: ${session.pickupAddress}\n📍 Entrega: ${msg}\n📏 Distância: ${session.distanceKm} km\n💰 Frete: *R$ ${freight.toFixed(2).replace('.', ',')}*\n\nAlguma observação para o motoboy? (ou responda *não*)`
+      );
       break;
     }
 
@@ -236,26 +257,43 @@ async function handleBotMessage(phone, text) {
       session.note  = /^n[ãa]o$/i.test(msg) ? '' : msg;
       session.state = 'awaiting_confirm';
       sessions.set(phone, session);
-      await sendWhatsApp(phone, `Confirme:\n\n🏪 *Retirada:* ${estab.address}\n📍 *Entrega:* ${session.deliveryAddress}\n📏 *Distância:* ${session.distanceKm} km\n💰 *Frete:* R$ ${session.freightPrice.toFixed(2).replace('.', ',')}${session.note ? `\n📝 *Obs:* ${session.note}` : ''}\n\n*SIM* para gerar o PIX ou *NÃO* para cancelar.`);
+      await sendWhatsApp(phone,
+        `Confirme seu pedido:\n\n👤 *Nome:* ${session.name}\n🏪 *Retirada:* ${session.pickupAddress}\n📍 *Entrega:* ${session.deliveryAddress}\n📏 *Distância:* ${session.distanceKm} km\n💰 *Frete:* R$ ${session.freightPrice.toFixed(2).replace('.', ',')}${session.note ? `\n📝 *Obs:* ${session.note}` : ''}\n\nResponda *SIM* para gerar o PIX ou *NÃO* para cancelar.`
+      );
       break;
 
     case 'awaiting_confirm':
       if (/^sim$/i.test(msg)) {
         const orderId = uuidv4().slice(0, 8).toUpperCase();
-        const order = { orderId, phone, establishmentName: estab.name, pickupAddress: estab.address, pickupCoords: { lat: estab.lat, lng: estab.lng }, deliveryAddress: session.deliveryAddress, deliveryCoords: session.deliveryCoords, note: session.note || '', distanceKm: session.distanceKm, freightPrice: session.freightPrice, paymentId: null, requestId: null, status: 'awaiting_payment', createdAt: new Date().toISOString() };
+        const order = {
+          orderId, phone,
+          establishmentName: session.name,
+          pickupAddress:  session.pickupAddress,
+          pickupCoords:   session.pickupCoords,
+          deliveryAddress: session.deliveryAddress,
+          deliveryCoords:  session.deliveryCoords,
+          note:            session.note || '',
+          distanceKm:      session.distanceKm,
+          freightPrice:    session.freightPrice,
+          paymentId: null, requestId: null,
+          status: 'awaiting_payment',
+          createdAt: new Date().toISOString(),
+        };
         orders.set(orderId, order);
         sessions.delete(phone);
         await sendWhatsApp(phone, '⏳ Gerando PIX...');
         try {
-          const { paymentId, copyPaste } = await createPixPayment(orderId, session.freightPrice, `Frete #${orderId} — ${estab.name}`, phone);
+          const { paymentId, copyPaste } = await createPixPayment(orderId, session.freightPrice, `Frete #${orderId}`, phone);
           order.paymentId = paymentId;
           paymentToOrder.set(paymentId, orderId);
           sessions.set(phone, { state: 'awaiting_payment', orderId });
-          await sendWhatsApp(phone, `💳 *PIX gerado!*\n\nValor: *R$ ${session.freightPrice.toFixed(2).replace('.', ',')}*\n\nCopie o código:\n\n${copyPaste}\n\n_Confirmação automática após pagamento._\n\nPara cancelar: *CANCELAR*`);
+          await sendWhatsApp(phone,
+            `💳 *PIX gerado!*\n\nValor: *R$ ${session.freightPrice.toFixed(2).replace('.', ',')}*\n\nCopie o código abaixo:\n\n${copyPaste}\n\n_Confirmação automática após o pagamento._\n\nPara cancelar: *CANCELAR*`
+          );
         } catch (e) {
           console.error('MP error:', e.message);
           orders.delete(orderId);
-          await sendWhatsApp(phone, '❌ Erro ao gerar o PIX. Tente novamente.');
+          await sendWhatsApp(phone, '❌ Erro ao gerar o PIX. Tente novamente em instantes.');
         }
       } else {
         sessions.delete(phone);
@@ -264,7 +302,7 @@ async function handleBotMessage(phone, text) {
       break;
 
     case 'awaiting_payment':
-      await sendWhatsApp(phone, '⏳ Aguardando pagamento PIX...\n\nPara cancelar: *CANCELAR*');
+      await sendWhatsApp(phone, '⏳ Aguardando confirmação do pagamento PIX...\n\nPara cancelar: *CANCELAR*');
       break;
   }
 }
