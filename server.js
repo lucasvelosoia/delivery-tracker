@@ -188,6 +188,9 @@ app.post('/webhook/whatsapp', (req, res) => {
   res.sendStatus(200);
 });
 
+// Health check para Render / Railway
+app.get('/health', (_req, res) => res.json({ ok: true, uptime: process.uptime() }));
+
 // Servir a SPA de rastreio para qualquer /track/:id
 app.get('/track/:deliveryId', (_req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'track.html'));
