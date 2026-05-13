@@ -52,11 +52,30 @@ async function dbInit() {
       lat     DOUBLE PRECISION NOT NULL,
       lng     DOUBLE PRECISION NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS clients (
+      phone          TEXT PRIMARY KEY,
+      name           TEXT NOT NULL,
+      pickup_address TEXT NOT NULL,
+      pickup_lat     DOUBLE PRECISION NOT NULL,
+      pickup_lng     DOUBLE PRECISION NOT NULL
+    );
   `);
   const rows = await db.query('SELECT * FROM establishments');
   for (const r of rows.rows)
     establishments.set(r.phone, { name: r.name, address: r.address, lat: r.lat, lng: r.lng });
-  console.log(`✅ PostgreSQL conectado — ${rows.rows.length} estabelecimento(s)`);
+  const clientRows = await db.query('SELECT * FROM clients');
+  for (const r of clientRows.rows)
+    clients.set(r.phone, { name: r.name, pickupAddress: r.pickup_address, pickupCoords: { lat: r.pickup_lat, lng: r.pickup_lng } });
+  console.log(`✅ PostgreSQL conectado — ${rows.rows.length} estabelecimento(s), ${clientRows.rows.length} cliente(s) recorrente(s)`);
+}
+
+async function saveClient(phone, name, pickupAddress, pickupCoords) {
+  clients.set(phone, { name, pickupAddress, pickupCoords });
+  if (!db) return;
+  await db.query(
+    'INSERT INTO clients(phone,name,pickup_address,pickup_lat,pickup_lng) VALUES($1,$2,$3,$4,$5) ON CONFLICT(phone) DO UPDATE SET name=$2,pickup_address=$3,pickup_lat=$4,pickup_lng=$5',
+    [phone, name, pickupAddress, pickupCoords.lat, pickupCoords.lng]
+  ).catch(e => console.error('saveClient error:', e.message));
 }
 
 // ── In-memory stores ─────────────────────────────────────────────────────────
@@ -64,6 +83,7 @@ const deliveries      = new Map();
 const pendingRequests = new Map();
 const sessions        = new Map();
 const establishments  = new Map();
+const clients         = new Map(); // phone → { name, pickupAddress, pickupCoords }
 const orders          = new Map();
 const paymentToOrder  = new Map();
 
@@ -207,11 +227,13 @@ async function createRequestFromOrder(orderId) {
   pendingRequests.set(requestId, request);
   io.emit('new-delivery-request', request);
   console.log(`🚀 Corrida #${requestId} criada — ${order.establishmentName}`);
+  if (order.phone && order.establishmentName && order.pickupAddress && order.pickupCoords)
+    await saveClient(order.phone, order.establishmentName, order.pickupAddress, order.pickupCoords);
   await sendWhatsApp(order.phone, `✅ *Pagamento confirmado!*\n\nSeu pedido *#${orderId}* está na fila.\n🛵 Localizando o motoboy mais próximo...`);
 }
 
 // ── IA (Groq / Llama 3.3) ────────────────────────────────────────────────────
-const SYSTEM_PROMPT = `Você é um assistente de entregas por motoboy no Brasil. Seu trabalho é atender clientes via WhatsApp, coletar as informações necessárias e organizar a entrega.
+const SYSTEM_PROMPT = `Você é um assistente de entregas por motoboy chamado ZAP Entregas. Atende clientes via WhatsApp no Brasil.
 
 Tabela de frete:
 - Até 3km: R$8,00
@@ -220,15 +242,17 @@ Tabela de frete:
 - 10 a 15km: R$22,00
 - Acima de 15km: R$30,00
 
-Você precisa coletar OBRIGATORIAMENTE:
-1. Nome do cliente
-2. Endereço de RETIRADA (de onde o motoboy vai buscar)
-3. Endereço de ENTREGA (para onde vai entregar)
+Você precisa coletar (somente o que ainda não está confirmado na conversa):
+1. Nome do cliente — se a saudação inicial já menciona o nome, NÃO pergunte novamente
+2. Endereço de RETIRADA — se a saudação inicial já confirmou "mesmo local da última vez", NÃO pergunte; está resolvido
+3. Endereço de ENTREGA (para onde vai entregar) — sempre pergunte se não informado
 4. Observações (opcional)
 
 Regras:
 - Seja simpático, rápido e direto. Use emojis com moderação.
-- Quando tiver nome + endereço de retirada + endereço de entrega, use action "calculate_freight".
+- Para clientes recorrentes (quando a saudação já confirmou nome e local de retirada): assim que receber o endereço de entrega, use action "calculate_freight" imediatamente — não pergunte mais nada.
+- Para clientes novos: colete nome → retirada → entrega → obs.
+- Quando tiver nome + retirada confirmada + endereço de entrega, use action "calculate_freight".
 - Quando o cliente confirmar o pedido (sim, confirmo, pode ser, ok, etc.), use action "confirm_order".
 - Quando o cliente cancelar, use action "cancel".
 - Se o cliente perguntar preço antes de dar os endereços, explique a tabela e peça os endereços.
@@ -241,7 +265,7 @@ Responda SOMENTE com JSON válido neste formato:
   "message": "mensagem para o cliente",
   "action": "none|calculate_freight|confirm_order|cancel|awaiting_payment",
   "data": {
-    "name": "nome extraído ou null",
+    "name": "nome extraído da conversa ou null",
     "pickup_address": "endereço de retirada extraído ou null",
     "delivery_address": "endereço de entrega extraído ou null",
     "note": "observação ou null"
@@ -269,8 +293,34 @@ async function callGroq(messages) {
 async function handleBotMessage(phone, text) {
   const msg = text.trim();
 
-  // Sessão: { history: [{role,content}], data: {name,pickupAddress,pickupCoords,deliveryAddress,deliveryCoords,note,distanceKm,freightPrice}, state }
-  let session = sessions.get(phone) || { history: [], data: {}, state: 'chatting' };
+  // Sessão: { history, data, state, isReturning }
+  let session = sessions.get(phone);
+  const isNewSession = !session;
+  if (!session) session = { history: [], data: {}, state: 'chatting', isReturning: false };
+
+  // Primeira mensagem da sessão — saudação sem chamar IA
+  if (isNewSession) {
+    const known = clients.get(phone);
+    if (known) {
+      session.isReturning = true;
+      session.data.name          = known.name;
+      session.data.pickupAddress = known.pickupAddress;
+      session.data.pickupCoords  = known.pickupCoords;
+      const greeting = `Olá, *${known.name}*! 😊 Bem-vindo de volta ao *ZAP Entregas*! 🛵\n\nVamos retirar no mesmo local da última vez ✅\n\nQual é o endereço de entrega?`;
+      session.history.push({ role: 'user', content: msg });
+      session.history.push({ role: 'assistant', content: greeting });
+      sessions.set(phone, session);
+      await sendWhatsApp(phone, greeting);
+      return;
+    } else {
+      const greeting = `Olá! 👋 Bem-vindo ao *ZAP Entregas*! 🛵\n\nSou seu assistente de entregas por motoboy. Como posso te chamar?`;
+      session.history.push({ role: 'user', content: msg });
+      session.history.push({ role: 'assistant', content: greeting });
+      sessions.set(phone, session);
+      await sendWhatsApp(phone, greeting);
+      return;
+    }
+  }
 
   // Pedido aguardando pagamento — não passa pela IA
   if (session.state === 'awaiting_payment') {
@@ -315,7 +365,8 @@ async function handleBotMessage(phone, text) {
       await sendWhatsApp(phone, aiReply.message);
       await sendWhatsApp(phone, '⏳ Calculando distância e frete...');
 
-      const pickup = await geocode(session.data.pickupAddress);
+      // Clientes recorrentes já têm coords de retirada; novos precisam geocodificar
+      const pickup = session.data.pickupCoords || await geocode(session.data.pickupAddress);
       const dest   = await geocode(session.data.deliveryAddress);
 
       if (!pickup || !dest) {
@@ -340,7 +391,10 @@ async function handleBotMessage(phone, text) {
       session.data.distanceKm     = Math.round(km * 10) / 10;
       session.data.freightPrice   = calcFreight(km);
 
-      const summary = `📦 *Resumo da entrega:*\n\n👤 *Cliente:* ${session.data.name}\n🏪 *Retirada:* ${session.data.pickupAddress}\n📍 *Entrega:* ${session.data.deliveryAddress}\n📏 *Distância:* ${session.data.distanceKm} km\n💰 *Frete:* R$ ${session.data.freightPrice.toFixed(2).replace('.', ',')}${session.data.note ? `\n📝 *Obs:* ${session.data.note}` : ''}\n\nConfirma o pedido? Responda *SIM* para gerar o PIX.`;
+      const pickupLine = session.isReturning
+        ? 'Mesmo local da última vez ✅'
+        : session.data.pickupAddress;
+      const summary = `📦 *Resumo da entrega:*\n\n👤 *Cliente:* ${session.data.name}\n🏪 *Retirada:* ${pickupLine}\n📍 *Entrega:* ${session.data.deliveryAddress}\n📏 *Distância:* ${session.data.distanceKm} km\n💰 *Frete:* R$ ${session.data.freightPrice.toFixed(2).replace('.', ',')}${session.data.note ? `\n📝 *Obs:* ${session.data.note}` : ''}\n\nConfirma o pedido? Responda *SIM* para gerar o PIX.`;
 
       session.history.push({ role: 'assistant', content: summary });
       sessions.set(phone, session);
