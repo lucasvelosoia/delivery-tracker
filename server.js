@@ -344,7 +344,8 @@ Regras:
 - Assim que o cliente informar o endereço de entrega E a retirada já estiver confirmada no histórico, use action "calculate_freight" imediatamente — sem fazer mais perguntas.
 - Para clientes novos: colete nome → retirada → entrega → obs (opcional).
 - Quando tiver nome + retirada confirmada + endereço de entrega, use action "calculate_freight".
-- Quando o cliente confirmar o pedido (sim, confirmo, pode ser, ok, etc.), use action "confirm_order".
+- OBRIGATÓRIO: use "calculate_freight" ANTES de "confirm_order". NUNCA use "confirm_order" se antes não houve um "calculate_freight" na conversa — o sistema precisa calcular o frete no servidor.
+- Quando o cliente confirmar o pedido APÓS ver o resumo com frete (sim, confirmo, pode ser, ok, etc.), use action "confirm_order".
 - Quando o cliente cancelar, use action "cancel".
 - Se o cliente perguntar preço antes de dar os endereços, explique a tabela e peça os endereços.
 - Enquanto estiver coletando dados, use action "none".
@@ -519,12 +520,38 @@ async function handleBotMessage(phone, text) {
     }
 
     case 'confirm_order': {
-      await sendWhatsApp(phone, aiReply.message);
-
+      // Groq às vezes pula o calculate_freight e vai direto para confirm_order.
+      // Se o frete ainda não foi calculado, calculamos aqui antes de continuar.
       if (!session.data.freightPrice) {
-        await sendWhatsApp(phone, '⚠️ Ainda não calculamos o frete. Me informe os endereços de retirada e entrega.');
+        if (!session.data.pickupAddress || !session.data.deliveryAddress) {
+          await sendWhatsApp(phone, '⚠️ Preciso dos endereços de retirada e entrega para calcular o frete.');
+          return;
+        }
+        await sendWhatsApp(phone, '⏳ Calculando frete...');
+        const pickup = session.data.pickupCoords || await geocode(session.data.pickupAddress);
+        const dest   = await geocode(session.data.deliveryAddress);
+        if (!pickup || !dest) {
+          await sendWhatsApp(phone, '❌ Não consegui encontrar um dos endereços. Pode confirmar com rua, número e cidade?');
+          return;
+        }
+        const km = await getRoadDistanceKm(pickup, dest);
+        if (!km) {
+          await sendWhatsApp(phone, '❌ Não consegui calcular a rota. Tente informar os endereços novamente.');
+          return;
+        }
+        session.data.pickupCoords   = pickup;
+        session.data.deliveryCoords = dest;
+        session.data.distanceKm     = Math.round(km * 10) / 10;
+        session.data.freightPrice   = calcFreight(km);
+        const pickupLine = session.isReturning ? 'Mesmo local da última vez ✅' : session.data.pickupAddress;
+        const summary = `📦 *Resumo da entrega:*\n\n👤 *Cliente:* ${session.data.name}\n🏪 *Retirada:* ${pickupLine}\n📍 *Entrega:* ${session.data.deliveryAddress}\n📏 *Distância:* ${session.data.distanceKm} km\n💰 *Frete:* R$ ${session.data.freightPrice.toFixed(2).replace('.', ',')}${session.data.note ? `\n📝 *Obs:* ${session.data.note}` : ''}\n\nConfirma o pedido? Responda *SIM* para gerar o PIX.`;
+        session.history.push({ role: 'assistant', content: summary });
+        sessions.set(phone, session);
+        await sendWhatsApp(phone, summary);
         return;
       }
+
+      await sendWhatsApp(phone, aiReply.message);
 
       const orderId = uuidv4().slice(0, 8).toUpperCase();
       const order = {
