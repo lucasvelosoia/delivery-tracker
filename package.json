@@ -1,0 +1,17 @@
+{
+  "name": "delivery-tracker",
+  "version": "1.0.0",
+  "description": "Sistema de rastreio de entregas estilo Uber para WhatsApp",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "simulate": "node simulate.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "socket.io": "^4.7.2",
+    "uuid": "^9.0.0"
+  }
+}

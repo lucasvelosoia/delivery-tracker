@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <title>Rastreio de Entrega</title>
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #f0f0f0;
+      height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* ── Header ── */
+    #header {
+      background: #25D366;
+      color: #fff;
+      padding: 10px 16px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      box-shadow: 0 2px 8px rgba(0,0,0,.25);
+      z-index: 500;
+      flex-shrink: 0;
+    }
+    #header .icon { font-size: 26px; }
+    #header h1 { font-size: 15px; font-weight: 700; letter-spacing: .2px; }
+    #header small { font-size: 11px; opacity: .85; display: block; margin-top: 1px; }
+
+    /* ── Status bar ── */
+    #status-bar {
+      background: #fff;
+      padding: 7px 14px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      border-bottom: 1px solid #e0e0e0;
+      flex-shrink: 0;
+    }
+    #dot {
+      width: 9px; height: 9px;
+      border-radius: 50%;
+      background: #ccc;
+      flex-shrink: 0;
+      transition: background .4s;
+    }
+    #dot.on  { background: #25D366; animation: pulse 2s infinite; }
+    #dot.err { background: #e53935; }
+    #status-text { font-size: 12px; color: #555; }
+
+    /* ── Map ── */
+    #map { flex: 1; }
+
+    /* ── Waiting overlay ── */
+    #waiting {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(255,255,255,.55);
+      backdrop-filter: blur(4px);
+      z-index: 1000;
+    }
+    #waiting-box {
+      background: #fff;
+      border-radius: 16px;
+      padding: 28px 36px;
+      text-align: center;
+      box-shadow: 0 8px 32px rgba(0,0,0,.15);
+      max-width: 280px;
+    }
+    #waiting-box .emoji { font-size: 40px; margin-bottom: 12px; }
+    #waiting-box p { color: #444; font-size: 14px; line-height: 1.5; }
+    #waiting-box small { display: block; margin-top: 8px; color: #999; font-size: 11px; }
+
+    /* ── Truck marker ── */
+    .truck-marker {
+      width: 42px; height: 42px;
+      background: #fff;
+      border-radius: 50%;
+      border: 3px solid #25D366;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 20px;
+      box-shadow: 0 3px 10px rgba(0,0,0,.25);
+    }
+
+    /* ── Animations ── */
+    @keyframes pulse {
+      0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(37,211,102,.4); }
+      50%       { opacity: .7; box-shadow: 0 0 0 5px rgba(37,211,102,0); }
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .spinner {
+      width: 36px; height: 36px;
+      border: 3px solid #e0e0e0;
+      border-top-color: #25D366;
+      border-radius: 50%;
+      animation: spin .9s linear infinite;
+      margin: 0 auto 14px;
+    }
+
+    /* ── Info popup ── */
+    .leaflet-popup-content-wrapper {
+      border-radius: 10px;
+      box-shadow: 0 4px 16px rgba(0,0,0,.15);
+    }
+  </style>
+</head>
+<body>
+
+<div id="header">
+  <span class="icon">🛵</span>
+  <div>
+    <h1>Rastreio em Tempo Real</h1>
+    <small id="delivery-label">Carregando...</small>
+  </div>
+</div>
+
+<div id="status-bar">
+  <div id="dot"></div>
+  <span id="status-text">Conectando ao servidor...</span>
+</div>
+
+<div id="map"></div>
+
+<div id="waiting">
+  <div id="waiting-box">
+    <div class="spinner"></div>
+    <p>Aguardando a localização do motorista...</p>
+    <small id="waiting-id"></small>
+  </div>
+</div>
+
+<!-- Leaflet + Socket.io -->
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="/socket.io/socket.io.js"></script>
+
+<script>
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+const deliveryId = (() => {
+  const parts = location.pathname.split('/');
+  return (parts[parts.length - 1] || '').toUpperCase();
+})();
+
+document.getElementById('delivery-label').textContent = `Pedido #${deliveryId}`;
+document.getElementById('waiting-id').textContent     = `ID: ${deliveryId}`;
+
+if (!deliveryId) {
+  document.getElementById('waiting-box').innerHTML =
+    '<p>URL inválida. Nenhum ID de entrega encontrado.</p>';
+}
+
+// ── Map ───────────────────────────────────────────────────────────────────────
+
+const map = L.map('map', { zoomControl: true, attributionControl: true })
+             .setView([-22.953, -46.524], 14);
+
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  attribution: '© <a href="https://openstreetmap.org">OpenStreetMap</a>',
+  maxZoom: 19,
+}).addTo(map);
+
+const truckIcon = L.divIcon({
+  html: '<div class="truck-marker">🛵</div>',
+  className: '',
+  iconSize:   [42, 42],
+  iconAnchor: [21, 21],
+  popupAnchor:[0, -24],
+});
+
+// ── Smooth animation ─────────────────────────────────────────────────────────
+
+let marker       = null;
+let currentLatLng = null;
+let animFrame    = null;
+
+function easeInOut(t) {
+  return t < .5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+}
+
+function animateTo(fromLL, toLL, durationMs = 240) {
+  if (animFrame) cancelAnimationFrame(animFrame);
+  const start = performance.now();
+
+  (function step(now) {
+    const t = Math.min((now - start) / durationMs, 1);
+    const e = easeInOut(t);
+    marker.setLatLng([
+      fromLL.lat + (toLL.lat - fromLL.lat) * e,
+      fromLL.lng + (toLL.lng - fromLL.lng) * e,
+    ]);
+    if (t < 1) animFrame = requestAnimationFrame(step);
+  })(start);
+}
+
+// ── Socket.io ─────────────────────────────────────────────────────────────────
+
+const socket = io({ transports: ['websocket', 'polling'] });
+
+socket.on('connect', () => {
+  document.getElementById('dot').className       = 'on';
+  document.getElementById('status-text').textContent = `Conectado · Pedido #${deliveryId}`;
+  socket.emit('join-delivery', deliveryId);
+});
+
+socket.on('disconnect', () => {
+  document.getElementById('dot').className       = 'err';
+  document.getElementById('status-text').textContent = 'Conexão perdida — reconectando...';
+});
+
+socket.on('connect_error', () => {
+  document.getElementById('dot').className       = 'err';
+  document.getElementById('status-text').textContent = 'Erro de conexão';
+});
+
+socket.on('location-update', (data) => {
+  const newLL = L.latLng(data.lat, data.lng);
+
+  // Esconde overlay de espera na primeira posição
+  const waitEl = document.getElementById('waiting');
+  if (waitEl) waitEl.remove();
+
+  if (!marker) {
+    marker       = L.marker(newLL, { icon: truckIcon }).addTo(map);
+    currentLatLng = newLL;
+    map.setView(newLL, 16, { animate: true });
+    marker.bindPopup('<b>🛵 Motorista</b><br>Localização atual').openPopup();
+  } else {
+    animateTo(currentLatLng, newLL);
+    currentLatLng = newLL;
+
+    // Pan suave — só se o ponto sair da área visível
+    if (!map.getBounds().pad(-0.15).contains(newLL)) {
+      map.panTo(newLL, { animate: true, duration: 0.6 });
+    }
+  }
+
+  // Atualiza status com coordenadas
+  document.getElementById('status-text').textContent =
+    `Ao vivo · (${data.lat.toFixed(5)}, ${data.lng.toFixed(5)})`;
+});
+</script>
+</body>
+</html>
