@@ -270,12 +270,30 @@ async function sendWhatsApp(phoneOrJid, text) {
 
 // ── Geocodificação ────────────────────────────────────────────────────────────
 async function geocode(address) {
-  try {
-    const res  = await fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(address)}&format=json&limit=1&countrycodes=br`, { headers: { 'User-Agent': 'DeliveryBot/1.0' } });
-    const data = await res.json();
-    if (!data.length) return null;
-    return { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon), display: data[0].display_name };
-  } catch { return null; }
+  if (!address) return null;
+  const addr = address.trim();
+
+  // Tenta variações progressivamente mais simples para achar o endereço
+  const variants = [
+    addr,
+    `${addr}, Brasil`,
+    // Remove número da casa ("nº 123", "n. 12", "123") e tenta só a rua + cidade
+    addr.replace(/,?\s*(n[°º.]?\s*)?(\d+)\s*(?=-|,|$)/i, '').trim(),
+  ].filter((v, i, a) => v.length > 4 && a.indexOf(v) === i); // remove duplicatas e strings muito curtas
+
+  for (const q of variants) {
+    try {
+      const res  = await fetch(
+        `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=1&countrycodes=br`,
+        { headers: { 'User-Agent': 'ZAPEntregas/1.0' } }
+      );
+      const data = await res.json();
+      if (data.length) return { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon), display: data[0].display_name };
+    } catch { /* tenta próxima variação */ }
+    // Nominatim pede no máx 1 req/s
+    await new Promise(r => setTimeout(r, 1100));
+  }
+  return null;
 }
 
 async function getRoadDistanceKm(from, to) {
@@ -342,17 +360,19 @@ Tabela de frete:
 
 Você precisa coletar (somente o que ainda não está confirmado na conversa):
 1. Nome do cliente — se a saudação inicial já menciona o nome, NÃO pergunte novamente
-2. Endereço de RETIRADA — se a saudação inicial já confirmou "mesmo local da última vez", NÃO pergunte; está resolvido
-3. Endereço de ENTREGA (para onde vai entregar) — sempre pergunte se não informado
+2. Endereço de RETIRADA completo (rua + número + bairro/cidade) — se a saudação confirmou "mesmo local", está resolvido
+3. Endereço de ENTREGA completo (rua + número + bairro/cidade)
 4. Observações (opcional)
 
 Regras:
 - Seja simpático, rápido e direto. Use emojis com moderação.
-- Se no histórico houver "Retirarei no mesmo local" ou "Retirada em: X", o endereço de retirada já está confirmado — NÃO pergunte novamente.
-- Assim que o cliente informar o endereço de entrega E a retirada já estiver confirmada no histórico, use action "calculate_freight" imediatamente — sem fazer mais perguntas.
+- Pessoas frequentemente mandam o endereço PICADO (em partes, em mensagens separadas). Junte as partes antes de usar. Se ainda estiver incompleto, pergunte: "Pode confirmar o bairro/cidade?"
+- Um endereço só está COMPLETO quando tem pelo menos: rua/local + referência de número ou ponto de referência + cidade ou bairro reconhecível.
+- NUNCA dispare calculate_freight com endereço incompleto (ex: só "Rua das Flores" sem cidade/bairro).
+- Se no histórico houver "Retirarei no mesmo local" ou "Retirada em: X", a retirada está confirmada — não pergunte de novo.
+- Assim que tiver retirada + entrega completos, use action "calculate_freight".
 - Para clientes novos: colete nome → retirada → entrega → obs (opcional).
-- Quando tiver nome + retirada confirmada + endereço de entrega, use action "calculate_freight".
-- OBRIGATÓRIO: use "calculate_freight" ANTES de "confirm_order". NUNCA use "confirm_order" se antes não houve um "calculate_freight" na conversa — o sistema precisa calcular o frete no servidor.
+- OBRIGATÓRIO: use "calculate_freight" ANTES de "confirm_order". NUNCA use "confirm_order" sem ter passado por "calculate_freight".
 - Quando o cliente confirmar o pedido APÓS ver o resumo com frete (sim, confirmo, pode ser, ok, etc.), use action "confirm_order".
 - Quando o cliente cancelar, use action "cancel".
 - Se o cliente perguntar preço antes de dar os endereços, explique a tabela e peça os endereços.
@@ -513,8 +533,15 @@ async function handleBotMessage(phone, text) {
       const pickup = session.data.pickupCoords || await geocode(session.data.pickupAddress);
       const dest   = await geocode(session.data.deliveryAddress);
 
-      if (!pickup || !dest) {
-        const errMsg = '❌ Não consegui encontrar um dos endereços. Pode confirmar com rua, número e cidade?';
+      if (!pickup && !session.data.pickupCoords) {
+        const errMsg = `📍 Não encontrei o endereço de *retirada*: "${session.data.pickupAddress}"\n\nPode mandar a rua com número e cidade? Ex: _Rua das Flores, 123, São Paulo_`;
+        session.history.push({ role: 'assistant', content: errMsg });
+        sessions.set(phone, session);
+        await sendWhatsApp(phone, errMsg);
+        return;
+      }
+      if (!dest) {
+        const errMsg = `📍 Não encontrei o endereço de *entrega*: "${session.data.deliveryAddress}"\n\nPode mandar a rua com número e cidade? Ex: _Av. Paulista, 1000, São Paulo_`;
         session.history.push({ role: 'assistant', content: errMsg });
         sessions.set(phone, session);
         await sendWhatsApp(phone, errMsg);
