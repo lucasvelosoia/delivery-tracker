@@ -73,20 +73,41 @@ let waStatus  = 'disconnected';
 const WA_DIR  = '/tmp/wa_session';
 const logger  = pino({ level: 'silent' });
 
-function connectWA() {
-  useMultiFileAuthState(WA_DIR).then(({ state, saveCreds }) => {
-    const sock = makeWASocket({ auth: state, logger, printQRInTerminal: false, browser: ['MotoBot', 'Chrome', '120'] });
+// Log buffer para diagnóstico via /debug
+const waLogs = [];
+function waLog(...args) {
+  const msg = args.join(' ');
+  waLogs.push(`[${new Date().toISOString()}] ${msg}`);
+  if (waLogs.length > 100) waLogs.shift();
+  console.log(msg);
+}
+
+async function connectWA() {
+  try {
+    waLog('🔄 Iniciando Baileys...');
+    const { state, saveCreds } = await useMultiFileAuthState(WA_DIR);
+    waLog('✅ Auth state carregado');
+
+    const sock = makeWASocket({
+      auth: state,
+      logger,
+      printQRInTerminal: false,
+      browser: ['MotoBot', 'Chrome', '120'],
+      connectTimeoutMs: 60000,
+    });
+    waLog('✅ Socket criado, aguardando conexão...');
 
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
-      if (qr) { currentQR = qr; waStatus = 'qr'; console.log('📱 QR pronto — acesse /qr'); }
-      if (connection === 'open')  { waSocket = sock; waStatus = 'open'; currentQR = null; console.log('✅ WhatsApp conectado!'); }
+      waLog(`📡 connection.update: connection=${connection} qr=${!!qr}`);
+      if (qr) { currentQR = qr; waStatus = 'qr'; waLog('📱 QR gerado!'); }
+      if (connection === 'open')  { waSocket = sock; waStatus = 'open'; currentQR = null; waLog('✅ WhatsApp conectado!'); }
       if (connection === 'close') {
         waSocket = null; waStatus = 'disconnected';
         const code = lastDisconnect?.error?.output?.statusCode;
         const reconnect = code !== DisconnectReason.loggedOut;
-        console.log(`⚠️  WA fechou (${code}) — ${reconnect ? 'reconectando' : 'sessão expirada'}`);
+        waLog(`⚠️ WA fechou (${code}) — ${reconnect ? 'reconectando' : 'sessão expirada'}`);
         if (!reconnect) rmSync(WA_DIR, { recursive: true, force: true });
         setTimeout(connectWA, reconnect ? 5000 : 3000);
       }
@@ -101,7 +122,11 @@ function connectWA() {
         if (phone && text) await handleBotMessage(phone, text);
       }
     });
-  }).catch(e => { console.error('❌ WA error:', e.message); setTimeout(connectWA, 10000); });
+  } catch (e) {
+    waLog(`❌ connectWA erro: ${e.message}`);
+    waStatus = 'error';
+    setTimeout(connectWA, 10000);
+  }
 }
 
 async function sendWhatsApp(phone, text) {
@@ -329,6 +354,7 @@ app.post('/webhook/mercadopago', async (req, res) => {
 });
 
 app.get('/health', (_req, res) => res.json({ ok: true, uptime: process.uptime(), whatsapp: waStatus }));
+app.get('/debug',  (_req, res) => res.json({ waStatus, hasQR: !!currentQR, logs: waLogs }));
 app.get('/track/:id', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'track.html')));
 
 // ── Socket.io ─────────────────────────────────────────────────────────────────
