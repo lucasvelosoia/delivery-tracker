@@ -165,11 +165,19 @@ async function connectWA() {
     });
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (type !== 'notify') return;
+      waLog(`📨 messages.upsert type=${type} count=${messages.length}`);
       for (const msg of messages) {
-        if (msg.key.fromMe) continue;
-        const phone = msg.key.remoteJid?.replace('@s.whatsapp.net', '');
-        const text  = msg.message?.conversation || msg.message?.extendedTextMessage?.text || '';
+        const jid    = msg.key.remoteJid || '';
+        const fromMe = msg.key.fromMe;
+        const phone  = jid.replace('@s.whatsapp.net', '').replace('@g.us', '');
+        const text   = msg.message?.conversation
+          || msg.message?.extendedTextMessage?.text
+          || msg.message?.imageMessage?.caption
+          || '';
+        waLog(`  jid=${jid} fromMe=${fromMe} type=${type} text="${text.slice(0,30)}"`);
+        if (fromMe) continue;
+        if (jid.endsWith('@g.us')) continue; // ignora grupos
+        if (type !== 'notify') continue;
         if (phone && text) await handleBotMessage(phone, text);
       }
     });
