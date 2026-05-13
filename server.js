@@ -82,53 +82,16 @@ function waLog(...args) {
   console.log(msg);
 }
 
-// Salva/carrega sessão Baileys no PostgreSQL para sobreviver a restarts
-async function getDBAuthState() {
-  if (!db) return useMultiFileAuthState(WA_DIR); // fallback para arquivo
 
-  await db.query(`CREATE TABLE IF NOT EXISTS wa_session (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
-
-  const read = async (k) => {
-    const r = await db.query('SELECT value FROM wa_session WHERE key=$1', [k]);
-    return r.rows[0] ? JSON.parse(r.rows[0].value) : null;
-  };
-  const write = async (k, v) => db.query(
-    'INSERT INTO wa_session(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=$2',
-    [k, JSON.stringify(v)]
-  );
-  const del = async (k) => db.query('DELETE FROM wa_session WHERE key=$1', [k]);
-
-  const { initAuthCreds, BufferJSON } = await import('@whiskeysockets/baileys');
-
-  const readJSON  = async (k) => { const r = await db.query('SELECT value FROM wa_session WHERE key=$1', [k]); return r.rows[0] ? JSON.parse(r.rows[0].value, BufferJSON.reviver) : null; };
-  const writeJSON = async (k, v) => db.query('INSERT INTO wa_session(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=$2', [k, JSON.stringify(v, BufferJSON.replacer)]);
-
-  const creds = (await readJSON('creds')) || initAuthCreds();
-
-  return {
-    state: {
-      creds,
-      keys: {
-        get: async (type, ids) => {
-          const out = {};
-          await Promise.all(ids.map(async id => { out[id] = await readJSON(`${type}:${id}`); }));
-          return out;
-        },
-        set: async (data) => {
-          await Promise.all(Object.entries(data).flatMap(([type, items]) =>
-            Object.entries(items).map(([id, val]) => val ? writeJSON(`${type}:${id}`, val) : del(`${type}:${id}`))
-          ));
-        },
-      },
-    },
-    saveCreds: () => writeJSON('creds', creds),
-  };
-}
+let waReconnecting = false;
 
 async function connectWA() {
+  if (waReconnecting) return;
+  waReconnecting = true;
   try {
     waLog('🔄 Iniciando Baileys...');
-    const { state, saveCreds } = await getDBAuthState();
+    rmSync(WA_DIR, { recursive: true, force: true }); // sempre sessão limpa
+    const { state, saveCreds } = await useMultiFileAuthState(WA_DIR);
     waLog('✅ Auth state carregado');
 
     const { version } = await fetchLatestBaileysVersion();
@@ -141,6 +104,7 @@ async function connectWA() {
       printQRInTerminal: false,
       browser: Browsers.macOS('Desktop'),
       connectTimeoutMs: 60000,
+      keepAliveIntervalMs: 15000,
       getMessage: async () => ({ conversation: '' }),
     });
     waLog('✅ Socket criado, aguardando conexão...');
@@ -156,11 +120,8 @@ async function connectWA() {
         const code = lastDisconnect?.error?.output?.statusCode;
         const reconnect = code !== DisconnectReason.loggedOut;
         waLog(`⚠️ WA fechou (${code}) — ${reconnect ? 'reconectando' : 'sessão expirada'}`);
-        if (!reconnect) {
-          rmSync(WA_DIR, { recursive: true, force: true });
-          if (db) await db.query('DELETE FROM wa_session');
-        }
-        setTimeout(connectWA, reconnect ? 5000 : 3000);
+        waReconnecting = false;
+        setTimeout(connectWA, 5000);
       }
     });
 
@@ -184,6 +145,7 @@ async function connectWA() {
   } catch (e) {
     waLog(`❌ connectWA erro: ${e.message}`);
     waStatus = 'error';
+    waReconnecting = false;
     setTimeout(connectWA, 10000);
   }
 }
@@ -452,6 +414,14 @@ app.post('/webhook/mercadopago', async (req, res) => {
 
 app.get('/health', (_req, res) => res.json({ ok: true, uptime: process.uptime(), whatsapp: waStatus }));
 app.get('/debug',  (_req, res) => res.json({ waStatus, hasQR: !!currentQR, logs: waLogs }));
+app.post('/admin/reset-wa', requireAdmin, (_req, res) => {
+  waLog('🔄 Reset manual da sessão WA...');
+  waReconnecting = false;
+  if (waSocket) { try { waSocket.end(undefined); } catch(_) {} waSocket = null; }
+  rmSync(WA_DIR, { recursive: true, force: true });
+  setTimeout(connectWA, 1000);
+  res.json({ ok: true, message: 'Sessão resetada. Acesse /qr para escanear.' });
+});
 app.get('/track/:id', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'track.html')));
 
 // ── Socket.io ─────────────────────────────────────────────────────────────────
