@@ -226,11 +226,14 @@ async function connectWA() {
       if (connection === 'open')  { waSocket = sock; waStatus = 'open'; currentQR = null; waLog('✅ WhatsApp conectado!'); }
       if (connection === 'close') {
         waSocket = null; waStatus = 'disconnected';
-        const code = lastDisconnect?.error?.output?.statusCode;
-        const reconnect = code !== DisconnectReason.loggedOut;
-        waLog(`⚠️ WA fechou (${code}) — ${reconnect ? 'reconectando' : 'sessão expirada'}`);
+        const code       = lastDisconnect?.error?.output?.statusCode;
+        const isReplaced = code === DisconnectReason.connectionReplaced; // 440
+        const reconnect  = code !== DisconnectReason.loggedOut;
+        waLog(`⚠️ WA fechou (${code}) — ${isReplaced ? 'sessão substituída, aguardando...' : reconnect ? 'reconectando' : 'sessão expirada'}`);
         waReconnecting = false;
-        setTimeout(connectWA, 5000);
+        // Código 440: outra instância assumiu (acontece durante deploys no Render).
+        // Aguarda mais tempo para evitar loop de conflito entre instâncias.
+        if (reconnect) setTimeout(connectWA, isReplaced ? 20000 : 5000);
       }
     });
 
@@ -288,13 +291,18 @@ function calcFreight(km) { return FREIGHT_TABLE.find(t => km <= t.maxKm).price; 
 // ── Mercado Pago PIX ─────────────────────────────────────────────────────────
 async function createPixPayment(orderId, amount, description, phone) {
   if (!MP_TOKEN) throw new Error('MERCADOPAGO_ACCESS_TOKEN não configurado');
+  // phone pode ser JID completo (ex: 5511...@s.whatsapp.net) — limpa para usar no email
+  const cleanPhone = String(phone).replace(/@.*$/, '').replace(/\D/g, '') || 'cliente';
   const res = await fetch('https://api.mercadopago.com/v1/payments', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${MP_TOKEN}`, 'X-Idempotency-Key': orderId },
-    body: JSON.stringify({ transaction_amount: amount, description, payment_method_id: 'pix', payer: { email: `${phone}@entrega.bot` } }),
+    body: JSON.stringify({ transaction_amount: Number(amount), description, payment_method_id: 'pix', payer: { email: `frete${cleanPhone}@zapentregas.bot` } }),
   });
   const data = await res.json();
-  if (!data.id) throw new Error(JSON.stringify(data));
+  if (!data.id) {
+    console.error('MP API error:', JSON.stringify(data).slice(0, 400));
+    throw new Error(data.message || data.error || 'Erro Mercado Pago');
+  }
   return { paymentId: String(data.id), copyPaste: data.point_of_interaction?.transaction_data?.qr_code || '' };
 }
 
@@ -440,11 +448,30 @@ async function handleBotMessage(phone, text) {
     return;
   }
 
+  // Pedido com erro de PIX — tentar gerar novamente
+  if (session.state === 'pix_error') {
+    const order = orders.get(session.orderId);
+    if (!order) { sessions.delete(phone); return; }
+    await sendWhatsApp(phone, '🔄 Tentando gerar o PIX novamente...');
+    try {
+      const { paymentId, copyPaste } = await createPixPayment(order.orderId, order.freightPrice, `Frete #${order.orderId}`, phone);
+      order.paymentId = paymentId; order.status = 'awaiting_payment';
+      paymentToOrder.set(paymentId, order.orderId);
+      await dbUpdateOrder(order.orderId, { payment_id: paymentId, status: 'awaiting_payment' });
+      sessions.set(phone, { ...session, state: 'awaiting_payment' });
+      await sendWhatsApp(phone, `💳 *PIX gerado!*\n\nValor: *R$ ${order.freightPrice.toFixed(2).replace('.', ',')}*\n\nCopie o código abaixo:\n\n${copyPaste}\n\n_Confirmação automática após o pagamento._\n\nPara cancelar responda *CANCELAR*.`);
+    } catch (e) {
+      console.error('MP retry error:', e.message);
+      await sendWhatsApp(phone, `❌ Erro ao gerar PIX: ${e.message}\n\nMande qualquer mensagem para tentar de novo.`);
+    }
+    return;
+  }
+
   // Pedido aguardando pagamento — não passa pela IA
   if (session.state === 'awaiting_payment') {
     if (/^cancelar$/i.test(msg)) {
       const order = orders.get(session.orderId);
-      if (order) order.status = 'cancelled';
+      if (order) { order.status = 'cancelled'; await dbUpdateOrder(order.orderId, { status: 'cancelled' }); }
       sessions.delete(phone);
       await sendWhatsApp(phone, '❌ Pedido cancelado. Quando precisar é só chamar! 😊');
     } else {
@@ -583,9 +610,11 @@ async function handleBotMessage(phone, text) {
         );
       } catch (e) {
         console.error('MP error:', e.message);
-        orders.delete(orderId);
-        sessions.set(phone, { ...session, state: 'chatting' });
-        await sendWhatsApp(phone, '❌ Erro ao gerar o PIX. Tente novamente.');
+        // Mantém o pedido no sistema (não apaga) e permite retry
+        order.status = 'pix_error';
+        await dbUpdateOrder(orderId, { status: 'pix_error' });
+        sessions.set(phone, { ...session, state: 'pix_error', orderId });
+        await sendWhatsApp(phone, `❌ Erro ao gerar o PIX: ${e.message}\n\nMande qualquer mensagem para tentar de novo.`);
       }
       break;
     }
@@ -618,8 +647,8 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-const STATUS_LABEL = { awaiting_payment: '⏳ Aguardando PIX', paid: '💳 Pago', pending: '🔍 Aguardando motoboy', delivering: '🛵 Em entrega', cancelled: '❌ Cancelado', completed: '✅ Concluído' };
-const STATUS_CSS   = { awaiting_payment: 'yellow', paid: 'blue', pending: 'orange', delivering: 'green', cancelled: 'red', completed: 'darkgreen' };
+const STATUS_LABEL = { awaiting_payment: '⏳ Aguardando PIX', pix_error: '⚠️ Erro PIX', paid: '💳 Pago', pending: '🔍 Aguardando motoboy', delivering: '🛵 Em entrega', cancelled: '❌ Cancelado', completed: '✅ Concluído' };
+const STATUS_CSS   = { awaiting_payment: 'yellow', pix_error: 'red', paid: 'blue', pending: 'orange', delivering: 'green', cancelled: 'red', completed: 'darkgreen' };
 
 app.get('/painel', (req, res) => {
   const key = req.headers['x-admin-key'] || req.query.key;
