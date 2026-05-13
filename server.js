@@ -250,8 +250,9 @@ Você precisa coletar (somente o que ainda não está confirmado na conversa):
 
 Regras:
 - Seja simpático, rápido e direto. Use emojis com moderação.
-- Para clientes recorrentes (quando a saudação já confirmou nome e local de retirada): assim que receber o endereço de entrega, use action "calculate_freight" imediatamente — não pergunte mais nada.
-- Para clientes novos: colete nome → retirada → entrega → obs.
+- Se no histórico houver "Retirarei no mesmo local" ou "Retirada em: X", o endereço de retirada já está confirmado — NÃO pergunte novamente.
+- Assim que o cliente informar o endereço de entrega E a retirada já estiver confirmada no histórico, use action "calculate_freight" imediatamente — sem fazer mais perguntas.
+- Para clientes novos: colete nome → retirada → entrega → obs (opcional).
 - Quando tiver nome + retirada confirmada + endereço de entrega, use action "calculate_freight".
 - Quando o cliente confirmar o pedido (sim, confirmo, pode ser, ok, etc.), use action "confirm_order".
 - Quando o cliente cancelar, use action "cancel".
@@ -302,24 +303,50 @@ async function handleBotMessage(phone, text) {
   if (isNewSession) {
     const known = clients.get(phone);
     if (known) {
-      session.isReturning = true;
-      session.data.name          = known.name;
-      session.data.pickupAddress = known.pickupAddress;
-      session.data.pickupCoords  = known.pickupCoords;
-      const greeting = `Olá, *${known.name}*! 😊 Bem-vindo de volta ao *ZAP Entregas*! 🛵\n\nVamos retirar no mesmo local da última vez ✅\n\nQual é o endereço de entrega?`;
+      session.data.name    = known.name;
+      session._savedPickup = { pickupAddress: known.pickupAddress, pickupCoords: known.pickupCoords };
+      session.state        = 'confirm_pickup';
+      const greeting = `Olá, *${known.name}*! 😊 Bem-vindo de volta ao *ZAP Entregas*! 🛵\n\nVai retirar no mesmo local da última vez?\n📍 _${known.pickupAddress}_\n\nResponda *SIM* ou informe o novo endereço de retirada.`;
       session.history.push({ role: 'user', content: msg });
       session.history.push({ role: 'assistant', content: greeting });
       sessions.set(phone, session);
       await sendWhatsApp(phone, greeting);
-      return;
     } else {
       const greeting = `Olá! 👋 Bem-vindo ao *ZAP Entregas*! 🛵\n\nSou seu assistente de entregas por motoboy. Como posso te chamar?`;
       session.history.push({ role: 'user', content: msg });
       session.history.push({ role: 'assistant', content: greeting });
       sessions.set(phone, session);
       await sendWhatsApp(phone, greeting);
-      return;
     }
+    return;
+  }
+
+  // Confirmação do local de retirada (clientes recorrentes)
+  if (session.state === 'confirm_pickup') {
+    const saved  = session._savedPickup;
+    const isYes  = /^(s|sim|yes|pode|pode ser|isso|isso mesmo|mesmo|ok|claro|tá|ta|tá bom|ta bom|confirma|confirmado)\s*[!.]*$/i.test(msg.trim());
+    if (isYes) {
+      session.isReturning        = true;
+      session.data.pickupAddress = saved.pickupAddress;
+      session.data.pickupCoords  = saved.pickupCoords;
+      session.state              = 'chatting';
+      const reply = `✅ Perfeito! Retirarei no mesmo local.\n\nQual é o endereço de *entrega*?`;
+      session.history.push({ role: 'user', content: msg });
+      session.history.push({ role: 'assistant', content: reply });
+      sessions.set(phone, session);
+      await sendWhatsApp(phone, reply);
+    } else {
+      session.isReturning        = false;
+      session.data.pickupAddress = msg.trim();
+      session.data.pickupCoords  = null;
+      session.state              = 'chatting';
+      const reply = `📍 Anotado! Retirada em: *${msg.trim()}*\n\nQual é o endereço de *entrega*?`;
+      session.history.push({ role: 'user', content: msg });
+      session.history.push({ role: 'assistant', content: reply });
+      sessions.set(phone, session);
+      await sendWhatsApp(phone, reply);
+    }
+    return;
   }
 
   // Pedido aguardando pagamento — não passa pela IA
