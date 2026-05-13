@@ -68,124 +68,83 @@ const orders          = new Map();
 const paymentToOrder  = new Map();
 
 // ── WhatsApp (Baileys) ────────────────────────────────────────────────────────
-let waSocket   = null;
-let currentQR  = null;
-let waStatus   = 'disconnected'; // disconnected | qr | connecting | open
+let waSocket  = null;
+let currentQR = null;
+let waStatus  = 'disconnected'; // disconnected | qr | open | error
+const WA_SESSION_DIR = '/tmp/wa_session';
 
 async function initWhatsApp() {
-  const {
-    default: makeWASocket,
-    DisconnectReason,
-    BufferJSON,
-    initAuthCreds,
-    makeCacheableSignalKeyStore,
-    proto,
-  } = await import('@whiskeysockets/baileys');
+  try {
+    const baileys = await import('@whiskeysockets/baileys');
+    const makeWASocket          = baileys.default;
+    const { DisconnectReason, useMultiFileAuthState } = baileys;
 
-  const pino = (await import('pino')).default;
-  const logger = pino({ level: 'silent' });
+    const pino   = require('pino');
+    const logger = pino({ level: 'silent' });
+    const fs     = require('fs');
 
-  // ── Auth state no PostgreSQL ────────────────────────────────────────────
-  async function read(key) {
-    if (!db) return null;
-    const r = await db.query('SELECT value FROM wa_session WHERE key=$1', [key]);
-    return r.rows[0] ? JSON.parse(r.rows[0].value, BufferJSON.reviver) : null;
+    function connect() {
+      useMultiFileAuthState(WA_SESSION_DIR).then(({ state, saveCreds }) => {
+        const sock = makeWASocket({
+          auth: state,
+          logger,
+          printQRInTerminal: false,
+          browser: ['MotoBot', 'Chrome', '120.0'],
+        });
+
+        sock.ev.on('creds.update', saveCreds);
+
+        sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
+          if (qr) {
+            currentQR = qr;
+            waStatus  = 'qr';
+            console.log('📱 QR disponível em /qr');
+          }
+          if (connection === 'open') {
+            waSocket  = sock;
+            waStatus  = 'open';
+            currentQR = null;
+            console.log('✅ WhatsApp conectado!');
+          }
+          if (connection === 'close') {
+            waSocket = null;
+            waStatus = 'disconnected';
+            const code = lastDisconnect?.error?.output?.statusCode;
+            const shouldReconnect = code !== DisconnectReason.loggedOut;
+            console.log(`⚠️  WA desconectado (${code}) — ${shouldReconnect ? 'reconectando...' : 'sessão encerrada'}`);
+            if (shouldReconnect) {
+              setTimeout(connect, 5000);
+            } else {
+              fs.rmSync(WA_SESSION_DIR, { recursive: true, force: true });
+              setTimeout(connect, 3000);
+            }
+          }
+        });
+
+        sock.ev.on('messages.upsert', async ({ messages, type }) => {
+          if (type !== 'notify') return;
+          for (const msg of messages) {
+            if (msg.key.fromMe) continue;
+            const phone = msg.key.remoteJid?.replace('@s.whatsapp.net', '');
+            if (!phone) continue;
+            const text = msg.message?.conversation
+              || msg.message?.extendedTextMessage?.text
+              || '';
+            if (text) await handleBotMessage(phone, text);
+          }
+        });
+      }).catch(e => {
+        console.error('❌ WA connect error:', e.message);
+        waStatus = 'error';
+        setTimeout(connect, 10000);
+      });
+    }
+
+    connect();
+  } catch (e) {
+    console.error('❌ WhatsApp init error:', e.message);
+    waStatus = 'error';
   }
-  async function write(key, data) {
-    if (!db) return;
-    const val = JSON.stringify(data, BufferJSON.replacer);
-    await db.query(
-      'INSERT INTO wa_session(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=$2',
-      [key, val]
-    );
-  }
-  async function del(key) {
-    if (!db) return;
-    await db.query('DELETE FROM wa_session WHERE key=$1', [key]);
-  }
-
-  const creds = (await read('creds')) || initAuthCreds();
-
-  const state = {
-    creds,
-    keys: makeCacheableSignalKeyStore({
-      get: async (type, ids) => {
-        const result = {};
-        await Promise.all(ids.map(async (id) => {
-          let val = await read(`${type}:${id}`);
-          if (type === 'app-state-sync-key' && val)
-            val = proto.Message.AppStateSyncKeyData.fromObject(val);
-          result[id] = val;
-        }));
-        return result;
-      },
-      set: async (data) => {
-        await Promise.all(
-          Object.entries(data).flatMap(([type, items]) =>
-            Object.entries(items).map(([id, val]) =>
-              val ? write(`${type}:${id}`, val) : del(`${type}:${id}`)
-            )
-          )
-        );
-      },
-    }, logger),
-  };
-  const saveCreds = () => write('creds', creds);
-
-  // ── Criar socket ────────────────────────────────────────────────────────
-  function connect() {
-    const sock = makeWASocket({
-      auth: state,
-      logger,
-      printQRInTerminal: true,
-      browser: ['MotoBot', 'Chrome', '120.0'],
-    });
-
-    sock.ev.on('creds.update', saveCreds);
-
-    sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
-      if (qr) {
-        currentQR = qr;
-        waStatus  = 'qr';
-        console.log('\n📱 QR Code disponível em /qr');
-      }
-      if (connection === 'open') {
-        waSocket  = sock;
-        waStatus  = 'open';
-        currentQR = null;
-        console.log('\n✅ WhatsApp conectado!');
-      }
-      if (connection === 'close') {
-        waSocket = null;
-        waStatus = 'disconnected';
-        const code = lastDisconnect?.error?.output?.statusCode;
-        const shouldReconnect = code !== DisconnectReason.loggedOut;
-        console.log(`\n⚠️  WhatsApp desconectado (código ${code}) — ${shouldReconnect ? 'reconectando...' : 'sessão encerrada'}`);
-        if (shouldReconnect) setTimeout(connect, 5000);
-        else {
-          // Sessão expirada — limpa e reinicia para novo QR
-          if (db) await db.query('DELETE FROM wa_session');
-          setTimeout(connect, 3000);
-        }
-      }
-    });
-
-    sock.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (type !== 'notify') return;
-      for (const msg of messages) {
-        if (msg.key.fromMe) continue;
-        const phone = msg.key.remoteJid?.replace('@s.whatsapp.net', '');
-        if (!phone) continue;
-        const text = msg.message?.conversation
-          || msg.message?.extendedTextMessage?.text
-          || '';
-        if (!text) continue;
-        await handleBotMessage(phone, text);
-      }
-    });
-  }
-
-  connect();
 }
 
 async function sendWhatsApp(phone, text) {
@@ -462,14 +421,20 @@ app.get('/admin/whatsapp', requireAdmin, (_req, res) => {
 
 // ── QR Code ───────────────────────────────────────────────────────────────────
 app.get('/qr', async (req, res) => {
-  if (waStatus === 'open') {
-    return res.send('<h2 style="font-family:sans-serif;color:green">✅ WhatsApp conectado!</h2>');
-  }
-  if (!currentQR) {
-    return res.send(`<html><head><meta http-equiv="refresh" content="5"><style>body{font-family:sans-serif;text-align:center;padding:40px}</style></head><body><h2>⏳ Aguardando QR Code...</h2><p>Esta página atualiza automaticamente.</p></body></html>`);
-  }
+  const html = (body, refresh = 5) =>
+    `<html><head><meta http-equiv="refresh" content="${refresh}"><style>body{font-family:sans-serif;text-align:center;padding:40px;background:#f5f5f5}img{border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.15)}</style></head><body>${body}</body></html>`;
+
+  if (waStatus === 'open')
+    return res.send(html('<h2 style="color:green">✅ WhatsApp conectado!</h2><p>O bot está ativo e recebendo mensagens.</p>', 30));
+
+  if (waStatus === 'error')
+    return res.send(html('<h2 style="color:red">❌ Erro ao iniciar WhatsApp</h2><p>Verifique os logs no painel do Render.</p><p>Tentando novamente automaticamente...</p>'));
+
+  if (!currentQR)
+    return res.send(html('<h2>⏳ Gerando QR Code...</h2><p>Aguarde alguns segundos. Esta página atualiza automaticamente.</p>'));
+
   const qrImage = await QRCode.toDataURL(currentQR);
-  res.send(`<html><head><meta http-equiv="refresh" content="30"><style>body{font-family:sans-serif;text-align:center;padding:40px}</style></head><body><h2>📱 Escaneie com o WhatsApp</h2><img src="${qrImage}" style="max-width:300px"><p>Abra o WhatsApp → <b>Dispositivos conectados</b> → <b>Conectar dispositivo</b></p><p><small>Esta página atualiza automaticamente.</small></p></body></html>`);
+  res.send(html(`<h2>📱 Escaneie com o WhatsApp</h2><img src="${qrImage}" style="max-width:280px"><br><br><p>Abra o WhatsApp → <b>Dispositivos conectados</b> → <b>Conectar dispositivo</b></p><p><small>QR expira em ~60s. A página atualiza automaticamente.</small></p>`, 20));
 });
 
 // ── Routes — Entrega ──────────────────────────────────────────────────────────
