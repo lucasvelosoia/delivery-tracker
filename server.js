@@ -26,9 +26,11 @@ app.use(express.static(path.join(__dirname, 'public')));
 const HOST_URL  = process.env.HOST_URL
   || (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : null)
   || `http://localhost:${process.env.PORT || 3000}`;
-const ADMIN_KEY = process.env.ADMIN_KEY || 'admin123';
-const DB_URL    = process.env.DATABASE_URL || '';
-const GROQ_KEY  = process.env.GROQ_API_KEY || '';
+const ADMIN_KEY    = process.env.ADMIN_KEY || 'admin123';
+const DB_URL       = process.env.DATABASE_URL || '';
+const GROQ_KEY     = process.env.GROQ_API_KEY || '';
+const GOOGLE_KEY   = process.env.GOOGLE_MAPS_KEY || '';
+const MAPBOX_TOKEN = process.env.MAPBOX_TOKEN || '';
 
 const FREIGHT_TABLE = [
   { maxKm: 3,        price: 8  },
@@ -282,17 +284,57 @@ async function sendWhatsApp(phoneOrJid, text) {
 }
 
 // ── Geocodificação ────────────────────────────────────────────────────────────
-async function geocode(address) {
-  if (!address) return null;
-  const addr = address.trim();
 
-  // Tenta variações progressivamente mais simples para achar o endereço
+// 1. ViaCEP — resolve CEP brasileiro em endereço completo
+async function lookupCep(raw) {
+  const digits = raw.replace(/\D/g, '');
+  if (digits.length !== 8) return null;
+  try {
+    const res  = await fetchWithTimeout(`https://viacep.com.br/ws/${digits}/json/`, {}, 6000);
+    const data = await res.json();
+    if (data.erro) return null;
+    return [data.logradouro, data.bairro, data.localidade, data.uf].filter(Boolean).join(', ');
+  } catch { return null; }
+}
+
+// 2. Google Maps Geocoding (melhor cobertura para Brasil)
+async function geocodeGoogle(addr) {
+  if (!GOOGLE_KEY) return null;
+  try {
+    const res  = await fetchWithTimeout(
+      `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(addr)}&region=br&language=pt-BR&key=${GOOGLE_KEY}`,
+      {}, 8000
+    );
+    const data = await res.json();
+    const r    = data?.results?.[0];
+    if (!r) return null;
+    return { lat: r.geometry.location.lat, lng: r.geometry.location.lng, display: r.formatted_address };
+  } catch { return null; }
+}
+
+// 3. Mapbox Geocoding (100k req/mês grátis, boa cobertura BR)
+async function geocodeMapbox(addr) {
+  if (!MAPBOX_TOKEN) return null;
+  try {
+    const res  = await fetchWithTimeout(
+      `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(addr)}.json?country=br&language=pt&limit=1&access_token=${MAPBOX_TOKEN}`,
+      {}, 8000
+    );
+    const data = await res.json();
+    const feat = data?.features?.[0];
+    if (!feat) return null;
+    const [lng, lat] = feat.center;
+    return { lat, lng, display: feat.place_name };
+  } catch { return null; }
+}
+
+// 4. Nominatim (OSM) — sem chave, mas fraco para BR
+async function geocodeNominatim(addr) {
   const variants = [
     addr,
     `${addr}, Brasil`,
-    // Remove número da casa ("nº 123", "n. 12", "123") e tenta só a rua + cidade
-    addr.replace(/,?\s*(n[°º.]?\s*)?(\d+)\s*(?=-|,|$)/i, '').trim(),
-  ].filter((v, i, a) => v.length > 4 && a.indexOf(v) === i); // remove duplicatas e strings muito curtas
+    addr.replace(/,?\s*(n[°º.]?\s*)?(\d+)\s*(?=,|$)/i, '').trim(),
+  ].filter((v, i, a) => v.length > 4 && a.indexOf(v) === i);
 
   for (const q of variants) {
     try {
@@ -306,8 +348,11 @@ async function geocode(address) {
     } catch {}
     await new Promise(r => setTimeout(r, 1100));
   }
+  return null;
+}
 
-  // Fallback: Photon (OpenStreetMap, cobertura melhor para endereços brasileiros)
+// 5. Photon (Komoot) — fallback OSM com melhor cobertura BR
+async function geocodePhoton(addr) {
   try {
     const res  = await fetchWithTimeout(
       `https://photon.komoot.io/api/?q=${encodeURIComponent(addr + ', Brasil')}&limit=1&lang=pt`,
@@ -315,13 +360,28 @@ async function geocode(address) {
     );
     const data = await res.json();
     const feat = data?.features?.[0];
-    if (feat) {
-      const [lng, lat] = feat.geometry.coordinates;
-      return { lat, lng, display: feat.properties?.name || addr };
-    }
-  } catch {}
+    if (!feat) return null;
+    const [lng, lat] = feat.geometry.coordinates;
+    return { lat, lng, display: feat.properties?.name || addr };
+  } catch { return null; }
+}
 
-  return null;
+// Orquestrador: CEP → Google → Mapbox → Nominatim → Photon
+async function geocode(address) {
+  if (!address) return null;
+  const addr = address.trim();
+
+  // Se parece com CEP, resolve via ViaCEP e usa o endereço expandido
+  const cepExpanded = await lookupCep(addr);
+  const query       = cepExpanded || addr;
+
+  return (
+    (await geocodeGoogle(query))    ||
+    (await geocodeMapbox(query))    ||
+    (await geocodeNominatim(query)) ||
+    (await geocodePhoton(query))    ||
+    null
+  );
 }
 
 function haversineKm(a, b) {
@@ -463,8 +523,9 @@ async function handleBotMessage(phone, text) {
 
     case 'confirm_pickup': {
       const parsed = await aiParse(msg,
-        `O cliente está confirmando o mesmo local anterior ou informando um novo endereço de retirada? ` +
-        `Retorne: {"intent": "confirm" | "new_address", "address": "endereço extraído e normalizado se new_address, senão null"}`
+        'O cliente está confirmando o mesmo local anterior ou informando um novo endereço de retirada? ' +
+        'Se novo endereço, normalize para o formato "Logradouro, Número, Bairro, Cidade, UF". ' +
+        'Retorne JSON: {"intent": "confirm" | "new_address", "address": "endereço normalizado completo se new_address, senão null"}'
       );
       const intent  = parsed?.intent ?? (YES_RE.test(msg) ? 'confirm' : 'new_address');
       if (intent === 'confirm') {
@@ -491,7 +552,11 @@ async function handleBotMessage(phone, text) {
     }
 
     case 'collect_pickup': {
-      const parsed     = await aiParse(msg, 'Extraia e normalize o endereço brasileiro desta mensagem. Retorne: {"address": "endereço normalizado ou null"}');
+      const parsed     = await aiParse(msg,
+        'Normalize o endereço brasileiro para o formato "Logradouro, Número, Bairro, Cidade, UF". ' +
+        'Se CEP presente inclua. Infira cidade/estado pelo contexto quando óbvio. ' +
+        'Retorne JSON: {"address": "endereço normalizado completo ou null"}'
+      );
       const rawAddress = parsed?.address || msg;
       await sendWhatsApp(phone, `⏳ Verificando endereço de retirada...`);
       const coords = await geocode(rawAddress);
@@ -508,7 +573,11 @@ async function handleBotMessage(phone, text) {
     }
 
     case 'collect_delivery': {
-      const parsed     = await aiParse(msg, 'Extraia e normalize o endereço brasileiro desta mensagem. Retorne: {"address": "endereço normalizado ou null"}');
+      const parsed     = await aiParse(msg,
+        'Normalize o endereço brasileiro para o formato "Logradouro, Número, Bairro, Cidade, UF". ' +
+        'Se CEP presente inclua. Infira cidade/estado pelo contexto quando óbvio. ' +
+        'Retorne JSON: {"address": "endereço normalizado completo ou null"}'
+      );
       const rawAddress = parsed?.address || msg;
       await sendWhatsApp(phone, `⏳ Verificando endereço e calculando frete...`);
       const dest = await geocode(rawAddress);

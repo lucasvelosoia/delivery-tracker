@@ -20,5 +20,9 @@ services:
           property: connectionString
       - key: GROQ_API_KEY
         sync: false
+      - key: GOOGLE_MAPS_KEY
+        sync: false
+      - key: MAPBOX_TOKEN
+        sync: false
       - key: ADMIN_KEY
         sync: false
