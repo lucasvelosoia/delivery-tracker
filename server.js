@@ -815,16 +815,18 @@ async function handleBotMessage(phone, text, opts = {}) {
         await dbSaveOrder(order);
         session.orderId = orderId;
         if (session.isPartner) {
+          session.pendingOrderIds = [...(session.pendingOrderIds || []), orderId];
           session.state = 'partner_more_orders';
           sessions.set(phone, session);
-          await sendWhatsApp(phone, `✅ *Pedido #${orderId} registrado!* 🛵\n\n🔍 Buscando entregador... O link de rastreio chega assim que alguém aceitar.`);
-          await sendWhatsApp(phone, `Tem mais pedidos? Mande a próxima foto com o endereço na legenda ou responda *NÃO* para encerrar.`);
+          const total = session.pendingOrderIds.length;
+          await sendWhatsApp(phone, `✅ *Pedido #${orderId} anotado!* (${total} no total)\n\nTem mais entregas? Mande a próxima foto com o endereço, ou responda *NÃO* para chamar o motoboy agora.`);
+          // createRequestFromOrder chamado só quando ela encerrar
         } else {
           session.state = 'waiting_driver';
           sessions.set(phone, session);
           await sendWhatsApp(phone, `✅ *Pedido #${orderId} registrado!*\n\n🔍 Buscando entregador disponível...\nVocê será avisado assim que um motoboy aceitar.\n\nPara cancelar, responda *CANCELAR*.`);
+          await createRequestFromOrder(orderId);
         }
-        await createRequestFromOrder(orderId);
       } else if (intent === 'cancel') {
         sessions.delete(phone);
         await sendWhatsApp(phone, '❌ Pedido cancelado. Quando precisar é só chamar! 😊');
@@ -866,8 +868,14 @@ async function handleBotMessage(phone, text, opts = {}) {
 
     case 'partner_more_orders': {
       if (NO_RE.test(msg) && !hasPhoto) {
+        const ids = session.pendingOrderIds || [];
         sessions.delete(phone);
-        await sendWhatsApp(phone, `✅ Pedidos registrados. Até logo! 😊`);
+        if (ids.length === 0) {
+          await sendWhatsApp(phone, `✅ Ok! Até logo! 😊`);
+        } else {
+          await sendWhatsApp(phone, `🛵 Chamando motoboy para *${ids.length} entrega(s)*...\nO link de rastreio chega assim que alguém aceitar.`);
+          for (const id of ids) await createRequestFromOrder(id);
+        }
         break;
       }
       // Nova foto ou mensagem com endereço — reinicia como nova entrega
