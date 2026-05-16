@@ -585,12 +585,11 @@ async function handleBotMessage(phone, text) {
           await sendWhatsApp(phone, `📍 Não encontrei esse endereço. Pode informar com mais detalhes?\nEx: _Rua das Flores, 123, Centro, São Paulo_\n\nOu responda *SIM* para usar o mesmo local anterior.`);
           return;
         }
-        session.isReturning        = false;
-        session.data.pickupAddress = rawAddress;
-        session.data.pickupCoords  = coords;
-        session.state              = 'collect_delivery';
+        session.isReturning    = false;
+        session._pendingPickup = { address: coords.display || rawAddress, coords };
+        session.state          = 'confirm_pickup_addr';
         sessions.set(phone, session);
-        await sendWhatsApp(phone, `✅ Retirada confirmada!\n\nQual é o endereço de *entrega*?\nEx: _Av. Paulista, 1000, Bela Vista, São Paulo_`);
+        await sendWhatsApp(phone, `📍 Encontrei este local de retirada:\n\n*${coords.display || rawAddress}*\n\nEstá correto? Responda *SIM* para confirmar ou *NÃO* para informar novamente.`);
       }
       break;
     }
@@ -609,11 +608,29 @@ async function handleBotMessage(phone, text) {
         await sendWhatsApp(phone, `📍 Não encontrei esse endereço. Pode informar com mais detalhes?\nEx: _Rua das Flores, 123, Centro, São Paulo_`);
         return;
       }
-      session.data.pickupAddress = rawAddress;
-      session.data.pickupCoords  = coords;
-      session.state              = 'collect_delivery';
+      session._pendingPickup = { address: coords.display || rawAddress, coords };
+      session.state          = 'confirm_pickup_addr';
       sessions.set(phone, session);
-      await sendWhatsApp(phone, `✅ Retirada confirmada!\n\nQual é o endereço de *entrega*?\nEx: _Av. Paulista, 1000, Bela Vista, São Paulo_`);
+      await sendWhatsApp(phone, `📍 Encontrei este local de retirada:\n\n*${coords.display || rawAddress}*\n\nEstá correto? Responda *SIM* para confirmar ou *NÃO* para informar novamente.`);
+      break;
+    }
+
+    case 'confirm_pickup_addr': {
+      const parsed = await aiParse(msg, 'O cliente está confirmando (sim) ou negando (não)? Retorne: {"intent": "confirm" | "deny"}');
+      const intent = parsed?.intent ?? (YES_RE.test(msg) ? 'confirm' : 'deny');
+      if (intent === 'confirm') {
+        session.data.pickupAddress = session._pendingPickup.address;
+        session.data.pickupCoords  = session._pendingPickup.coords;
+        delete session._pendingPickup;
+        session.state = 'collect_delivery';
+        sessions.set(phone, session);
+        await sendWhatsApp(phone, `✅ Retirada confirmada!\n\nQual é o endereço de *entrega*?\nEx: _Av. Paulista, 1000, Bela Vista, São Paulo_`);
+      } else {
+        delete session._pendingPickup;
+        session.state = 'collect_pickup';
+        sessions.set(phone, session);
+        await sendWhatsApp(phone, `Ok! Me informe o endereço de retirada com mais detalhes.\nEx: _Rua das Flores, 123, Centro, São Paulo_`);
+      }
       break;
     }
 
@@ -625,20 +642,44 @@ async function handleBotMessage(phone, text) {
         return;
       }
       const rawAddress = addrParsed?.address || msg;
-      await sendWhatsApp(phone, `⏳ Verificando endereço e calculando frete...`);
+      await sendWhatsApp(phone, `⏳ Verificando endereço de entrega...`);
       const dest = await geocode(rawAddress);
       if (!dest) {
         await sendWhatsApp(phone, `📍 Não encontrei esse endereço. Pode informar com mais detalhes?\nEx: _Av. Paulista, 1000, Bela Vista, São Paulo_`);
         return;
       }
       const km = await getRoadDistanceKm(session.data.pickupCoords, dest);
-      session.data.deliveryAddress = rawAddress;
-      session.data.deliveryCoords  = dest;
-      session.data.distanceKm      = Math.round(km * 10) / 10;
-      session.data.freightPrice    = calcFreight(km);
-      session.state                = 'collect_package';
+      const distanceKm  = Math.round(km * 10) / 10;
+      const freightPrice = calcFreight(km);
+      session._pendingDelivery = { address: dest.display || rawAddress, coords: dest, distanceKm, freightPrice };
+      session.state = 'confirm_delivery_addr';
       sessions.set(phone, session);
-      await sendWhatsApp(phone, `✅ Entrega confirmada! Frete: *R$ ${session.data.freightPrice.toFixed(2).replace('.', ',')}* (${session.data.distanceKm} km)\n\nO que será entregue?\nEx: _documento, caixa pequena, roupa, eletrônico, remédio..._`);
+      await sendWhatsApp(phone,
+        `📍 Encontrei este local de entrega:\n\n*${dest.display || rawAddress}*\n\n` +
+        `📏 Distância: ${distanceKm} km  |  💰 Frete: *R$ ${freightPrice.toFixed(2).replace('.', ',')}*\n\n` +
+        `Está correto? Responda *SIM* para confirmar ou *NÃO* para informar novamente.`
+      );
+      break;
+    }
+
+    case 'confirm_delivery_addr': {
+      const parsed = await aiParse(msg, 'O cliente está confirmando (sim) ou negando (não)? Retorne: {"intent": "confirm" | "deny"}');
+      const intent = parsed?.intent ?? (YES_RE.test(msg) ? 'confirm' : 'deny');
+      if (intent === 'confirm') {
+        session.data.deliveryAddress = session._pendingDelivery.address;
+        session.data.deliveryCoords  = session._pendingDelivery.coords;
+        session.data.distanceKm      = session._pendingDelivery.distanceKm;
+        session.data.freightPrice    = session._pendingDelivery.freightPrice;
+        delete session._pendingDelivery;
+        session.state = 'collect_package';
+        sessions.set(phone, session);
+        await sendWhatsApp(phone, `✅ Entrega confirmada!\n\nO que será entregue?\nEx: _documento, caixa pequena, roupa, eletrônico, remédio..._`);
+      } else {
+        delete session._pendingDelivery;
+        session.state = 'collect_delivery';
+        sessions.set(phone, session);
+        await sendWhatsApp(phone, `Ok! Me informe o endereço de entrega com mais detalhes.\nEx: _Av. Paulista, 1000, Bela Vista, São Paulo_`);
+      }
       break;
     }
 
