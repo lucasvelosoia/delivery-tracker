@@ -499,6 +499,23 @@ async function handleBotMessage(phone, text) {
   const msg = text.trim();
   let session = sessions.get(phone);
 
+  // ── CANCELAR global — encerra qualquer estado ──────────────────────────────
+  if (session && CANCEL_RE.test(msg)) {
+    const order = session.orderId ? orders.get(session.orderId) : null;
+    if (order && order.status === 'pending') {
+      order.status = 'cancelled';
+      await dbUpdateOrder(order.orderId, { status: 'cancelled' });
+      if (order.requestId) {
+        const req = pendingRequests.get(order.requestId);
+        if (req) req.status = 'cancelled';
+        io.emit('request-taken', { requestId: order.requestId });
+      }
+    }
+    sessions.delete(phone);
+    await sendWhatsApp(phone, '❌ Atendimento encerrado. Quando precisar é só chamar! 😊');
+    return;
+  }
+
   // ── Primeira mensagem: sem sessão ──────────────────────────────────────────
   if (!session) {
     const known = clients.get(phone);
