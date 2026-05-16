@@ -18,7 +18,7 @@ services:
         fromDatabase:
           name: app-db
           property: connectionString
-      - key: MERCADOPAGO_ACCESS_TOKEN
+      - key: GROQ_API_KEY
         sync: false
       - key: ADMIN_KEY
         sync: false
