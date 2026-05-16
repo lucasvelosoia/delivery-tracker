@@ -86,6 +86,15 @@ async function dbInit() {
       active     BOOLEAN DEFAULT true,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
+    CREATE TABLE IF NOT EXISTS partners (
+      phone           TEXT PRIMARY KEY,
+      name            TEXT NOT NULL,
+      pickup_address  TEXT NOT NULL,
+      pickup_lat      DOUBLE PRECISION NOT NULL,
+      pickup_lng      DOUBLE PRECISION NOT NULL,
+      default_package TEXT DEFAULT 'entrega',
+      created_at      TIMESTAMPTZ DEFAULT NOW()
+    );
   `);
   const rows = await db.query('SELECT * FROM establishments');
   for (const r of rows.rows)
@@ -99,7 +108,10 @@ async function dbInit() {
   const driverRows = await db.query('SELECT * FROM drivers ORDER BY created_at DESC');
   for (const r of driverRows.rows)
     drivers.set(r.phone, { phone: r.phone, name: r.name, active: r.active, createdAt: r.created_at?.toISOString?.() || r.created_at });
-  console.log(`✅ PostgreSQL conectado — ${rows.rows.length} estabelecimento(s), ${clientRows.rows.length} cliente(s), ${orderRows.rows.length} pedido(s), ${driverRows.rows.length} entregador(es)`);
+  const partnerRows = await db.query('SELECT * FROM partners ORDER BY created_at DESC');
+  for (const r of partnerRows.rows)
+    partners.set(r.phone, { phone: r.phone, name: r.name, pickupAddress: r.pickup_address, pickupCoords: { lat: r.pickup_lat, lng: r.pickup_lng }, defaultPackage: r.default_package, createdAt: r.created_at?.toISOString?.() || r.created_at });
+  console.log(`✅ PostgreSQL conectado — ${rows.rows.length} estabelecimento(s), ${clientRows.rows.length} cliente(s), ${orderRows.rows.length} pedido(s), ${driverRows.rows.length} entregador(es), ${partnerRows.rows.length} parceiro(s)`);
 }
 
 const dbSaveOrder = (o) => {
@@ -136,6 +148,7 @@ const establishments  = new Map();
 const clients         = new Map(); // phone → { name, pickupAddress, pickupCoords }
 const orders          = new Map();
 const drivers         = new Map(); // phone → { name, phone, active, createdAt }
+const partners        = new Map(); // phone → { name, pickupAddress, pickupCoords, defaultPackage }
 
 // ── WhatsApp auth state persistente no PostgreSQL ────────────────────────────
 async function usePostgresAuthState(pool) {
@@ -530,6 +543,13 @@ async function handleBotMessage(phone, text) {
 
   // ── Primeira mensagem: sem sessão ──────────────────────────────────────────
   if (!session) {
+    const partner = partners.get(phone);
+    if (partner) {
+      session = { state: 'collect_delivery', data: { name: partner.name, pickupAddress: partner.pickupAddress, pickupCoords: partner.pickupCoords, packageType: partner.defaultPackage }, isPartner: true };
+      sessions.set(phone, session);
+      await sendWhatsApp(phone, `Olá, *${partner.name}*! 😊\n\nPara onde vai a entrega?\nEx: _Rua das Flores, 123, Centro, Bragança Paulista_`);
+      return;
+    }
     const known = clients.get(phone);
     if (known) {
       session = { state: 'confirm_pickup', data: { name: known.name, pickupAddress: known.pickupAddress, pickupCoords: known.pickupCoords }, isReturning: false };
@@ -672,9 +692,15 @@ async function handleBotMessage(phone, text) {
         session.data.distanceKm      = session._pendingDelivery.distanceKm;
         session.data.freightPrice    = session._pendingDelivery.freightPrice;
         delete session._pendingDelivery;
-        session.state = 'collect_package';
-        sessions.set(phone, session);
-        await sendWhatsApp(phone, `✅ Entrega confirmada!\n\nO que será entregue?\nEx: _documento, caixa pequena, roupa, eletrônico, remédio..._`);
+        if (session.data.packageType) {
+          session.state = 'collect_note';
+          sessions.set(phone, session);
+          await sendWhatsApp(phone, `✅ Entrega confirmada!\n\nAlguma observação para o entregador? (Ex: ligar na portaria, entregar na recepção...)\nOu responda *NÃO* para pular.`);
+        } else {
+          session.state = 'collect_package';
+          sessions.set(phone, session);
+          await sendWhatsApp(phone, `✅ Entrega confirmada!\n\nO que será entregue?\nEx: _documento, caixa pequena, roupa, eletrônico, remédio..._`);
+        }
       } else {
         delete session._pendingDelivery;
         session.state = 'collect_delivery';
@@ -832,6 +858,15 @@ app.get('/painel', (req, res) => {
     <td><button class="btn-danger" onclick="removeDriver('${d.phone}')">Remover</button></td>
   </tr>`).join('');
 
+  const partnerList = [...partners.values()].map(p => `<tr>
+    <td>${p.name}</td>
+    <td>${p.phone}</td>
+    <td>${p.pickupAddress}</td>
+    <td>${p.defaultPackage}</td>
+    <td>${dt(p.createdAt)}</td>
+    <td><button class="btn-danger" onclick="removePartner('${p.phone}')">Remover</button></td>
+  </tr>`).join('');
+
   res.send(`<!DOCTYPE html>
 <html lang="pt-BR"><head><meta charset="UTF-8">
 <title>ZAP Entregas — Painel</title>
@@ -884,6 +919,7 @@ small{color:#aaa;font-size:.73rem}
   <div class="stat"><div class="n">${stats.cancelados}</div><div class="l">Cancelados</div></div>
   <div class="stat"><div class="n">${sessions.size}</div><div class="l">Sessões ativas</div></div>
   <div class="stat"><div class="n">${drivers.size}</div><div class="l">Entregadores</div></div>
+  <div class="stat"><div class="n">${partners.size}</div><div class="l">Parceiros</div></div>
 </div>
 
 <div class="section">
@@ -899,6 +935,25 @@ small{color:#aaa;font-size:.73rem}
     <table><thead><tr><th>Nome</th><th>Telefone</th><th>Cadastrado em</th><th></th></tr></thead>
     <tbody id="drv-list">
 ${driverList || '<tr><td colspan="4" class="empty">Nenhum entregador cadastrado</td></tr>'}
+    </tbody></table>
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-title">Parceiros (fluxo simplificado)</div>
+  <div class="card">
+    <div class="card-body" style="border-bottom:1px solid #f0f0f0">
+      <form class="inline" onsubmit="addPartner(event)">
+        <input id="prt-name" placeholder="Nome (ex: Floricultura Bella Flores)" required>
+        <input id="prt-phone" placeholder="WhatsApp (ex: 11999990000)" required>
+        <input id="prt-addr" placeholder="Endereço de retirada" required style="min-width:220px">
+        <input id="prt-pkg" placeholder="Tipo de entrega padrão (ex: flores)">
+        <button type="submit" class="btn btn-green">+ Cadastrar</button>
+      </form>
+    </div>
+    <table><thead><tr><th>Nome</th><th>Telefone</th><th>Endereço de retirada</th><th>Pacote padrão</th><th>Cadastrado em</th><th></th></tr></thead>
+    <tbody>
+${partnerList || '<tr><td colspan="6" class="empty">Nenhum parceiro cadastrado</td></tr>'}
     </tbody></table>
   </div>
 </div>
@@ -948,6 +1003,24 @@ async function addDriver(e) {
 async function removeDriver(phone) {
   if (!confirm('Remover este entregador?')) return;
   const res = await api('DELETE', '/admin/driver/' + phone);
+  if (res.ok) { toast('Removido.'); setTimeout(() => location.reload(), 800); }
+  else toast('Erro', false);
+}
+
+async function addPartner(e) {
+  e.preventDefault();
+  const name           = document.getElementById('prt-name').value.trim();
+  const phone          = document.getElementById('prt-phone').value.trim();
+  const pickupAddress  = document.getElementById('prt-addr').value.trim();
+  const defaultPackage = document.getElementById('prt-pkg').value.trim() || 'entrega';
+  const res = await api('POST', '/admin/partner', { name, phone, pickupAddress, defaultPackage });
+  if (res.ok) { toast('Parceiro cadastrado!'); setTimeout(() => location.reload(), 800); }
+  else toast(res.error || 'Erro ao geocodificar o endereço', false);
+}
+
+async function removePartner(phone) {
+  if (!confirm('Remover este parceiro?')) return;
+  const res = await api('DELETE', '/admin/partner/' + phone);
   if (res.ok) { toast('Removido.'); setTimeout(() => location.reload(), 800); }
   else toast('Erro', false);
 }
@@ -1015,6 +1088,31 @@ app.post('/admin/clear-sessions', requireAdmin, (_req, res) => {
   sessions.clear();
   console.log(`🧹 Sessões limpas (${count} removidas)`);
   res.json({ ok: true, cleared: count });
+});
+
+app.get('/admin/partners', requireAdmin, (_req, res) =>
+  res.json([...partners.values()]));
+
+app.post('/admin/partner', requireAdmin, async (req, res) => {
+  const { phone, name, pickupAddress } = req.body;
+  if (!phone || !name || !pickupAddress) return res.status(400).json({ error: 'phone, name e pickupAddress obrigatórios' });
+  const defaultPackage = req.body.defaultPackage || 'entrega';
+  const coords = await geocode(pickupAddress);
+  if (!coords) return res.status(400).json({ error: 'Não foi possível geocodificar o endereço de retirada' });
+  const partner = { phone: String(phone).replace(/\D/g, ''), name: name.trim(), pickupAddress, pickupCoords: coords, defaultPackage, createdAt: new Date().toISOString() };
+  partners.set(partner.phone, partner);
+  if (db) await db.query(
+    'INSERT INTO partners(phone,name,pickup_address,pickup_lat,pickup_lng,default_package) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(phone) DO UPDATE SET name=$2,pickup_address=$3,pickup_lat=$4,pickup_lng=$5,default_package=$6',
+    [partner.phone, partner.name, partner.pickupAddress, coords.lat, coords.lng, partner.defaultPackage]
+  ).catch(e => console.error('savePartner:', e.message));
+  res.json({ ok: true, partner });
+});
+
+app.delete('/admin/partner/:phone', requireAdmin, async (req, res) => {
+  const phone = req.params.phone.replace(/\D/g, '');
+  partners.delete(phone);
+  if (db) await db.query('DELETE FROM partners WHERE phone=$1', [phone]).catch(e => console.error('deletePartner:', e.message));
+  res.json({ ok: true });
 });
 
 // ── QR Code ───────────────────────────────────────────────────────────────────
