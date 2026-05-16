@@ -26,7 +26,6 @@ app.use(express.static(path.join(__dirname, 'public')));
 const HOST_URL  = process.env.HOST_URL
   || (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : null)
   || `http://localhost:${process.env.PORT || 3000}`;
-const MP_TOKEN  = process.env.MERCADOPAGO_ACCESS_TOKEN || '';
 const ADMIN_KEY = process.env.ADMIN_KEY || 'admin123';
 const DB_URL    = process.env.DATABASE_URL || '';
 const GROQ_KEY  = process.env.GROQ_API_KEY || '';
@@ -67,12 +66,17 @@ async function dbInit() {
       delivery_address TEXT,
       distance_km      REAL,
       freight_price    REAL,
-      status           TEXT DEFAULT 'awaiting_payment',
-      payment_id       TEXT,
+      status           TEXT DEFAULT 'pending',
       request_id       TEXT,
+      delivery_id      TEXT,
+      driver_name      TEXT,
+      package_type     TEXT,
       note             TEXT,
       created_at       TIMESTAMPTZ DEFAULT NOW()
     );
+    ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS delivery_id TEXT;
+    ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS driver_name TEXT;
+    ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS package_type TEXT;
   `);
   const rows = await db.query('SELECT * FROM establishments');
   for (const r of rows.rows)
@@ -82,16 +86,16 @@ async function dbInit() {
     clients.set(r.phone, { name: r.name, pickupAddress: r.pickup_address, pickupCoords: { lat: r.pickup_lat, lng: r.pickup_lng } });
   const orderRows = await db.query('SELECT * FROM pedidos ORDER BY created_at DESC LIMIT 500');
   for (const r of orderRows.rows)
-    orders.set(r.order_id, { orderId: r.order_id, phone: r.phone, establishmentName: r.customer_name, pickupAddress: r.pickup_address, deliveryAddress: r.delivery_address, distanceKm: r.distance_km, freightPrice: r.freight_price, status: r.status, paymentId: r.payment_id, requestId: r.request_id, note: r.note, createdAt: r.created_at?.toISOString?.() || r.created_at });
+    orders.set(r.order_id, { orderId: r.order_id, phone: r.phone, establishmentName: r.customer_name, pickupAddress: r.pickup_address, deliveryAddress: r.delivery_address, distanceKm: r.distance_km, freightPrice: r.freight_price, status: r.status, requestId: r.request_id, deliveryId: r.delivery_id, driverName: r.driver_name, packageType: r.package_type, note: r.note, createdAt: r.created_at?.toISOString?.() || r.created_at });
   console.log(`✅ PostgreSQL conectado — ${rows.rows.length} estabelecimento(s), ${clientRows.rows.length} cliente(s), ${orderRows.rows.length} pedido(s)`);
 }
 
 const dbSaveOrder = (o) => {
   if (!db) return Promise.resolve();
   return db.query(
-    `INSERT INTO pedidos(order_id,phone,customer_name,pickup_address,delivery_address,distance_km,freight_price,status,note)
-     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(order_id) DO NOTHING`,
-    [o.orderId, o.phone, o.establishmentName, o.pickupAddress, o.deliveryAddress, o.distanceKm, o.freightPrice, o.status, o.note]
+    `INSERT INTO pedidos(order_id,phone,customer_name,pickup_address,delivery_address,distance_km,freight_price,status,package_type,note)
+     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(order_id) DO NOTHING`,
+    [o.orderId, o.phone, o.establishmentName, o.pickupAddress, o.deliveryAddress, o.distanceKm, o.freightPrice, o.status, o.packageType || '', o.note]
   ).catch(e => console.error('dbSaveOrder:', e.message));
 };
 
@@ -119,7 +123,6 @@ const sessions        = new Map();
 const establishments  = new Map();
 const clients         = new Map(); // phone → { name, pickupAddress, pickupCoords }
 const orders          = new Map();
-const paymentToOrder  = new Map();
 
 // ── WhatsApp auth state persistente no PostgreSQL ────────────────────────────
 async function usePostgresAuthState(pool) {
@@ -344,341 +347,279 @@ async function getRoadDistanceKm(from, to) {
 
 function calcFreight(km) { return FREIGHT_TABLE.find(t => km <= t.maxKm).price; }
 
-// ── Mercado Pago PIX ─────────────────────────────────────────────────────────
-async function createPixPayment(orderId, amount, description, phone) {
-  if (!MP_TOKEN) throw new Error('MERCADOPAGO_ACCESS_TOKEN não configurado');
-  // phone pode ser JID completo (ex: 5511...@s.whatsapp.net) — limpa para usar no email
-  const cleanPhone = String(phone).replace(/@.*$/, '').replace(/\D/g, '') || 'cliente';
-  const res = await fetch('https://api.mercadopago.com/v1/payments', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${MP_TOKEN}`, 'X-Idempotency-Key': orderId },
-    body: JSON.stringify({ transaction_amount: Number(amount), description, payment_method_id: 'pix', payer: { email: `frete${cleanPhone}@zapentregas.bot` } }),
-  });
-  const data = await res.json();
-  if (!data.id) {
-    console.error('MP API error:', JSON.stringify(data).slice(0, 400));
-    throw new Error(data.message || data.error || 'Erro Mercado Pago');
-  }
-  return { paymentId: String(data.id), copyPaste: data.point_of_interaction?.transaction_data?.qr_code || '' };
-}
-
-async function getPaymentStatus(paymentId) {
-  try {
-    const res  = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, { headers: { 'Authorization': `Bearer ${MP_TOKEN}` } });
-    const data = await res.json();
-    return data.status;
-  } catch { return null; }
-}
-
-// ── Criar corrida após pagamento ─────────────────────────────────────────────
+// ── Criar corrida após confirmação ───────────────────────────────────────────
 async function createRequestFromOrder(orderId) {
   const order = orders.get(orderId);
   if (!order || order.requestId) return;
   const requestId = uuidv4().slice(0, 8).toUpperCase();
-  const request = { requestId, customerName: order.establishmentName, address: order.deliveryAddress, pickupAddress: order.pickupAddress, phone: order.phone, note: order.note, distanceKm: order.distanceKm, freightPrice: order.freightPrice, orderId, status: 'pending', createdAt: new Date().toISOString() };
-  order.requestId = requestId; order.status = 'pending';
+  const request = {
+    requestId,
+    customerName: order.establishmentName,
+    address:      order.deliveryAddress,
+    pickupAddress: order.pickupAddress,
+    phone:        order.phone,
+    note:         order.note,
+    packageType:  order.packageType,
+    distanceKm:   order.distanceKm,
+    freightPrice: order.freightPrice,
+    orderId,
+    status: 'pending',
+    createdAt: new Date().toISOString(),
+  };
+  order.requestId = requestId;
+  order.status    = 'pending';
   pendingRequests.set(requestId, request);
   io.emit('new-delivery-request', request);
   console.log(`🚀 Corrida #${requestId} criada — ${order.establishmentName}`);
   await dbUpdateOrder(orderId, { status: 'pending', request_id: requestId });
   if (order.phone && order.establishmentName && order.pickupAddress && order.pickupCoords)
     await saveClient(order.phone, order.establishmentName, order.pickupAddress, order.pickupCoords);
-  await sendWhatsApp(order.phone, `✅ *Pedido #${orderId} confirmado!*\n\n🛵 Procurando motoboy disponível...\n\nVocê receberá o link de rastreio assim que um motoboy aceitar.`);
 }
 
-// ── IA (Groq / Llama 3.3) ────────────────────────────────────────────────────
-const SYSTEM_PROMPT = `Você é um assistente de entregas por motoboy chamado ZAP Entregas. Atende clientes via WhatsApp no Brasil.
+// ── Parser IA — interpreta variações de linguagem (Groq, 100 tokens max) ─────
+const PARSER_SYSTEM = 'Você é um parser de mensagens WhatsApp para um serviço de entregas no Brasil. Extraia exatamente o que for pedido e retorne JSON puro, sem texto extra.';
 
-Tabela de frete:
-- Até 3km: R$8,00
-- 3 a 6km: R$12,00
-- 6 a 10km: R$16,00
-- 10 a 15km: R$22,00
-- Acima de 15km: R$30,00
-
-Você precisa coletar (somente o que ainda não está confirmado na conversa):
-1. Nome do cliente — se a saudação inicial já menciona o nome, NÃO pergunte novamente
-2. Endereço de RETIRADA completo (rua + número + bairro/cidade) — se a saudação confirmou "mesmo local", está resolvido
-3. Endereço de ENTREGA completo (rua + número + bairro/cidade)
-4. Observações (opcional)
-
-Regras:
-- Seja simpático, rápido e direto. Use emojis com moderação.
-- Pessoas frequentemente mandam o endereço PICADO (em partes, em mensagens separadas). Junte as partes antes de usar. Se ainda estiver incompleto, pergunte: "Pode confirmar o bairro/cidade?"
-- Um endereço só está COMPLETO quando tem pelo menos: rua/local + referência de número ou ponto de referência + cidade ou bairro reconhecível.
-- NUNCA dispare calculate_freight com endereço incompleto (ex: só "Rua das Flores" sem cidade/bairro).
-- Se no histórico houver "Retirarei no mesmo local" ou "Retirada em: X", a retirada está confirmada — não pergunte de novo.
-- Assim que tiver retirada + entrega completos, use action "calculate_freight".
-- Para clientes novos: colete nome → retirada → entrega → obs (opcional).
-- OBRIGATÓRIO: use "calculate_freight" ANTES de "confirm_order". NUNCA use "confirm_order" sem ter passado por "calculate_freight".
-- Quando o cliente confirmar o pedido APÓS ver o resumo com frete (sim, confirmo, pode ser, ok, etc.), use action "confirm_order".
-- Quando o cliente cancelar, use action "cancel".
-- Se o cliente perguntar preço antes de dar os endereços, explique a tabela e peça os endereços.
-- Enquanto estiver coletando dados, use action "none".
-- Se o pagamento já foi gerado e o cliente mandar qualquer coisa, use action "awaiting_payment".
-- Responda SEMPRE em português brasileiro informal.
-
-Responda SOMENTE com JSON válido neste formato:
-{
-  "message": "mensagem para o cliente",
-  "action": "none|calculate_freight|confirm_order|cancel|awaiting_payment",
-  "data": {
-    "name": "nome extraído da conversa ou null",
-    "pickup_address": "endereço de retirada extraído ou null",
-    "delivery_address": "endereço de entrega extraído ou null",
-    "note": "observação ou null"
-  }
-}`;
-
-async function callGroq(messages) {
-  const res = await fetchWithTimeout(
-    'https://api.groq.com/openai/v1/chat/completions',
-    {
+async function aiParse(userMsg, instruction) {
+  if (!GROQ_KEY) return null;
+  try {
+    const res = await fetchWithTimeout('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${GROQ_KEY}` },
       body: JSON.stringify({
         model: 'llama-3.3-70b-versatile',
-        messages: [{ role: 'system', content: SYSTEM_PROMPT }, ...messages],
+        messages: [
+          { role: 'system', content: PARSER_SYSTEM },
+          { role: 'user',   content: `Mensagem do cliente: "${userMsg}"\n\n${instruction}` },
+        ],
         response_format: { type: 'json_object' },
-        temperature: 0.3,
-        max_tokens: 600,
+        temperature: 0.1,
+        max_tokens: 80,
       }),
-    },
-    25000 // Groq raramente demora mais que 10s, mas damos 25s de margem
-  );
-  const json = await res.json();
-  if (!res.ok) throw new Error(json.error?.message || 'Groq error');
-  return JSON.parse(json.choices[0].message.content);
+    }, 12000);
+    const json = await res.json();
+    if (!res.ok) return null;
+    return JSON.parse(json.choices[0].message.content);
+  } catch { return null; }
 }
 
-// ── Bot com IA ────────────────────────────────────────────────────────────────
+// ── Bot — máquina de estado (fluxo e cálculos 100% server-side) ──────────────
+const YES_RE    = /^(s|si|sim|yes|pode|pode ser|isso|isso mesmo|mesmo|ok|claro|tá|ta|tá bom|ta bom|confirma|confirmado|quero|vai|bora|manda)\s*[!.]*$/i;
+const NO_RE     = /^(n|nao|não|nope|nop|cancel|cancelar|desistir|para)\s*[!.]*$/i;
+const SKIP_RE   = /^(n|nao|não|nope|nop|pular|skip|-|nenhuma|nada|sem obs)\s*[!.]*$/i;
+const CANCEL_RE = /^cancelar\s*[!.]*$/i;
+
+function buildSummary(data, isReturning) {
+  const pickupLine = isReturning ? 'Mesmo local da última vez ✅' : data.pickupAddress;
+  const etaMin     = Math.ceil(data.distanceKm * 3 + 5);
+  return (
+    `📦 *Resumo da entrega:*\n\n` +
+    `👤 *Cliente:* ${data.name}\n` +
+    `🏪 *Retirada:* ${pickupLine}\n` +
+    `📍 *Entrega:* ${data.deliveryAddress}\n` +
+    `📦 *Pacote:* ${data.packageType}\n` +
+    `📏 *Distância:* ${data.distanceKm} km\n` +
+    `⏱️ *Tempo estimado:* ~${etaMin} min\n` +
+    `💰 *Frete:* R$ ${data.freightPrice.toFixed(2).replace('.', ',')}` +
+    (data.note ? `\n📝 *Obs:* ${data.note}` : '') +
+    `\n\nConfirma o pedido? Responda *SIM* para solicitar o motoboy ou *NÃO* para cancelar.`
+  );
+}
+
 async function handleBotMessage(phone, text) {
   const msg = text.trim();
-
-  // Sessão: { history, data, state, isReturning }
   let session = sessions.get(phone);
-  const isNewSession = !session;
-  if (!session) session = { history: [], data: {}, state: 'chatting', isReturning: false };
 
-  // Primeira mensagem da sessão — saudação sem chamar IA
-  if (isNewSession) {
+  // ── Primeira mensagem: sem sessão ──────────────────────────────────────────
+  if (!session) {
     const known = clients.get(phone);
     if (known) {
-      session.data.name    = known.name;
-      session._savedPickup = { pickupAddress: known.pickupAddress, pickupCoords: known.pickupCoords };
-      session.state        = 'confirm_pickup';
-      const greeting = `Olá, *${known.name}*! 😊 Bem-vindo de volta ao *ZAP Entregas*! 🛵\n\nVai retirar no mesmo local da última vez?\n📍 _${known.pickupAddress}_\n\nResponda *SIM* ou informe o novo endereço de retirada.`;
-      session.history.push({ role: 'user', content: msg });
-      session.history.push({ role: 'assistant', content: greeting });
+      session = { state: 'confirm_pickup', data: { name: known.name, pickupAddress: known.pickupAddress, pickupCoords: known.pickupCoords }, isReturning: false };
       sessions.set(phone, session);
-      await sendWhatsApp(phone, greeting);
+      await sendWhatsApp(phone, `Olá, *${known.name}*! 😊 Bem-vindo de volta ao *ZAP Entregas*! 🛵\n\nVai retirar no mesmo local da última vez?\n📍 _${known.pickupAddress}_\n\nResponda *SIM* ou informe o novo endereço de retirada.`);
     } else {
-      const greeting = `Olá! 👋 Bem-vindo ao *ZAP Entregas*! 🛵\n\nSou seu assistente de entregas por motoboy. Como posso te chamar?`;
-      session.history.push({ role: 'user', content: msg });
-      session.history.push({ role: 'assistant', content: greeting });
+      session = { state: 'collect_name', data: {}, isReturning: false };
       sessions.set(phone, session);
-      await sendWhatsApp(phone, greeting);
+      await sendWhatsApp(phone, `Olá! 👋 Bem-vindo ao *ZAP Entregas*! 🛵\n\nSou seu assistente de entregas por motoboy.\n\nComo posso te chamar?`);
     }
     return;
   }
 
-  // Confirmação do local de retirada (clientes recorrentes)
-  if (session.state === 'confirm_pickup') {
-    const saved  = session._savedPickup;
-    const isYes  = /^(s|sim|yes|pode|pode ser|isso|isso mesmo|mesmo|ok|claro|tá|ta|tá bom|ta bom|confirma|confirmado)\s*[!.]*$/i.test(msg.trim());
-    if (isYes) {
-      session.isReturning        = true;
-      session.data.pickupAddress = saved.pickupAddress;
-      session.data.pickupCoords  = saved.pickupCoords;
-      session.state              = 'chatting';
-      const reply = `✅ Perfeito! Retirarei no mesmo local.\n\nQual é o endereço de *entrega*?`;
-      session.history.push({ role: 'user', content: msg });
-      session.history.push({ role: 'assistant', content: reply });
-      sessions.set(phone, session);
-      await sendWhatsApp(phone, reply);
-    } else {
-      session.isReturning        = false;
-      session.data.pickupAddress = msg.trim();
-      session.data.pickupCoords  = null;
-      session.state              = 'chatting';
-      const reply = `📍 Anotado! Retirada em: *${msg.trim()}*\n\nQual é o endereço de *entrega*?`;
-      session.history.push({ role: 'user', content: msg });
-      session.history.push({ role: 'assistant', content: reply });
-      sessions.set(phone, session);
-      await sendWhatsApp(phone, reply);
-    }
-    return;
-  }
+  // ── Máquina de estados ────────────────────────────────────────────────────
+  switch (session.state) {
 
-  // Pedido com erro de PIX — tentar gerar novamente
-  if (session.state === 'pix_error') {
-    const order = orders.get(session.orderId);
-    if (!order) { sessions.delete(phone); return; }
-    await sendWhatsApp(phone, '🔄 Tentando gerar o PIX novamente...');
-    try {
-      const { paymentId, copyPaste } = await createPixPayment(order.orderId, order.freightPrice, `Frete #${order.orderId}`, phone);
-      order.paymentId = paymentId; order.status = 'awaiting_payment';
-      paymentToOrder.set(paymentId, order.orderId);
-      await dbUpdateOrder(order.orderId, { payment_id: paymentId, status: 'awaiting_payment' });
-      sessions.set(phone, { ...session, state: 'awaiting_payment' });
-      await sendWhatsApp(phone, `💳 *PIX gerado!*\n\nValor: *R$ ${order.freightPrice.toFixed(2).replace('.', ',')}*\n\nCopie o código abaixo:\n\n${copyPaste}\n\n_Confirmação automática após o pagamento._\n\nPara cancelar responda *CANCELAR*.`);
-    } catch (e) {
-      console.error('MP retry error:', e.message);
-      await sendWhatsApp(phone, `❌ Erro ao gerar PIX: ${e.message}\n\nMande qualquer mensagem para tentar de novo.`);
-    }
-    return;
-  }
-
-  // Pedido aguardando pagamento — não passa pela IA
-  if (session.state === 'awaiting_payment') {
-    if (/^cancelar$/i.test(msg)) {
-      const order = orders.get(session.orderId);
-      if (order) { order.status = 'cancelled'; await dbUpdateOrder(order.orderId, { status: 'cancelled' }); }
-      sessions.delete(phone);
-      await sendWhatsApp(phone, '❌ Pedido cancelado. Quando precisar é só chamar! 😊');
-    } else {
-      await sendWhatsApp(phone, '⏳ Aguardando confirmação do pagamento PIX...\n\nPara cancelar responda *CANCELAR*.');
-    }
-    return;
-  }
-
-  // Adiciona mensagem do usuário ao histórico
-  session.history.push({ role: 'user', content: msg });
-  if (session.history.length > 20) session.history = session.history.slice(-20);
-
-  let aiReply;
-  try {
-    aiReply = await callGroq(session.history);
-  } catch (e) {
-    console.error('Groq error:', e.message);
-    await sendWhatsApp(phone, '⚠️ Erro temporário. Tente novamente em instantes.');
-    return;
-  }
-
-  // Merge dados extraídos pela IA
-  const d = aiReply.data || {};
-  if (d.name)             session.data.name            = d.name;
-  if (d.pickup_address)   session.data.pickupAddress   = d.pickup_address;
-  if (d.delivery_address) session.data.deliveryAddress = d.delivery_address;
-  if (d.note)             session.data.note            = d.note;
-
-  // Adiciona resposta da IA ao histórico
-  session.history.push({ role: 'assistant', content: aiReply.message });
-  sessions.set(phone, session);
-
-  switch (aiReply.action) {
-
-    case 'calculate_freight': {
-      await sendWhatsApp(phone, '⏳ Calculando distância e frete...');
-
-      // Clientes recorrentes já têm coords de retirada; novos precisam geocodificar
-      const pickup = session.data.pickupCoords || await geocode(session.data.pickupAddress);
-      const dest   = await geocode(session.data.deliveryAddress);
-
-      if (!pickup && !session.data.pickupCoords) {
-        const errMsg = `📍 Não encontrei o endereço de *retirada*: "${session.data.pickupAddress}"\n\nPode mandar a rua com número e cidade? Ex: _Rua das Flores, 123, São Paulo_`;
-        session.history.push({ role: 'assistant', content: errMsg });
-        sessions.set(phone, session);
-        await sendWhatsApp(phone, errMsg);
+    case 'collect_name': {
+      const parsed = await aiParse(msg, 'Extraia apenas o nome próprio do cliente. Retorne: {"name": "nome ou null"}');
+      const name   = (parsed?.name || msg.replace(/^(me chamo|sou o|sou a|meu nome é|pode chamar de|pode me chamar de)\s+/i, '')).trim();
+      if (!name || name.length < 2) {
+        await sendWhatsApp(phone, 'Por favor, me diga seu nome para continuar. 😊');
         return;
       }
+      session.data.name = name;
+      session.state     = 'collect_pickup';
+      sessions.set(phone, session);
+      await sendWhatsApp(phone, `Prazer, *${name}*! 😊\n\nQual é o endereço de *retirada*?\nEx: _Rua das Flores, 123, Centro, São Paulo_`);
+      break;
+    }
+
+    case 'confirm_pickup': {
+      const parsed = await aiParse(msg,
+        `O cliente está confirmando o mesmo local anterior ou informando um novo endereço de retirada? ` +
+        `Retorne: {"intent": "confirm" | "new_address", "address": "endereço extraído e normalizado se new_address, senão null"}`
+      );
+      const intent  = parsed?.intent ?? (YES_RE.test(msg) ? 'confirm' : 'new_address');
+      if (intent === 'confirm') {
+        session.isReturning = true;
+        session.state       = 'collect_delivery';
+        sessions.set(phone, session);
+        await sendWhatsApp(phone, `✅ Perfeito! Retirada no mesmo local.\n\nQual é o endereço de *entrega*?\nEx: _Av. Paulista, 1000, Bela Vista, São Paulo_`);
+      } else {
+        const rawAddress = parsed?.address || msg;
+        await sendWhatsApp(phone, `⏳ Verificando endereço de retirada...`);
+        const coords = await geocode(rawAddress);
+        if (!coords) {
+          await sendWhatsApp(phone, `📍 Não encontrei esse endereço. Pode informar com mais detalhes?\nEx: _Rua das Flores, 123, Centro, São Paulo_\n\nOu responda *SIM* para usar o mesmo local anterior.`);
+          return;
+        }
+        session.isReturning        = false;
+        session.data.pickupAddress = rawAddress;
+        session.data.pickupCoords  = coords;
+        session.state              = 'collect_delivery';
+        sessions.set(phone, session);
+        await sendWhatsApp(phone, `✅ Retirada confirmada!\n\nQual é o endereço de *entrega*?\nEx: _Av. Paulista, 1000, Bela Vista, São Paulo_`);
+      }
+      break;
+    }
+
+    case 'collect_pickup': {
+      const parsed     = await aiParse(msg, 'Extraia e normalize o endereço brasileiro desta mensagem. Retorne: {"address": "endereço normalizado ou null"}');
+      const rawAddress = parsed?.address || msg;
+      await sendWhatsApp(phone, `⏳ Verificando endereço de retirada...`);
+      const coords = await geocode(rawAddress);
+      if (!coords) {
+        await sendWhatsApp(phone, `📍 Não encontrei esse endereço. Pode informar com mais detalhes?\nEx: _Rua das Flores, 123, Centro, São Paulo_`);
+        return;
+      }
+      session.data.pickupAddress = rawAddress;
+      session.data.pickupCoords  = coords;
+      session.state              = 'collect_delivery';
+      sessions.set(phone, session);
+      await sendWhatsApp(phone, `✅ Retirada confirmada!\n\nQual é o endereço de *entrega*?\nEx: _Av. Paulista, 1000, Bela Vista, São Paulo_`);
+      break;
+    }
+
+    case 'collect_delivery': {
+      const parsed     = await aiParse(msg, 'Extraia e normalize o endereço brasileiro desta mensagem. Retorne: {"address": "endereço normalizado ou null"}');
+      const rawAddress = parsed?.address || msg;
+      await sendWhatsApp(phone, `⏳ Verificando endereço e calculando frete...`);
+      const dest = await geocode(rawAddress);
       if (!dest) {
-        const errMsg = `📍 Não encontrei o endereço de *entrega*: "${session.data.deliveryAddress}"\n\nPode mandar a rua com número e cidade? Ex: _Av. Paulista, 1000, São Paulo_`;
-        session.history.push({ role: 'assistant', content: errMsg });
-        sessions.set(phone, session);
-        await sendWhatsApp(phone, errMsg);
+        await sendWhatsApp(phone, `📍 Não encontrei esse endereço. Pode informar com mais detalhes?\nEx: _Av. Paulista, 1000, Bela Vista, São Paulo_`);
         return;
       }
-
-      const km = await getRoadDistanceKm(pickup, dest);
-      if (!km) {
-        const errMsg = '❌ Não consegui calcular a rota. Tente informar os endereços novamente.';
-        session.history.push({ role: 'assistant', content: errMsg });
-        sessions.set(phone, session);
-        await sendWhatsApp(phone, errMsg);
-        return;
-      }
-
-      session.data.pickupCoords   = pickup;
-      session.data.deliveryCoords = dest;
-      session.data.distanceKm     = Math.round(km * 10) / 10;
-      session.data.freightPrice   = calcFreight(km);
-
-      const pickupLine = session.isReturning
-        ? 'Mesmo local da última vez ✅'
-        : session.data.pickupAddress;
-      const summary = `📦 *Resumo da entrega:*\n\n👤 *Cliente:* ${session.data.name}\n🏪 *Retirada:* ${pickupLine}\n📍 *Entrega:* ${session.data.deliveryAddress}\n📏 *Distância:* ${session.data.distanceKm} km\n💰 *Frete:* R$ ${session.data.freightPrice.toFixed(2).replace('.', ',')}${session.data.note ? `\n📝 *Obs:* ${session.data.note}` : ''}\n\nConfirma o pedido? Responda *SIM* para solicitar o motoboy.`;
-
-      session.history.push({ role: 'assistant', content: summary });
+      const km = await getRoadDistanceKm(session.data.pickupCoords, dest);
+      session.data.deliveryAddress = rawAddress;
+      session.data.deliveryCoords  = dest;
+      session.data.distanceKm      = Math.round(km * 10) / 10;
+      session.data.freightPrice    = calcFreight(km);
+      session.state                = 'collect_package';
       sessions.set(phone, session);
-      await sendWhatsApp(phone, summary);
+      await sendWhatsApp(phone, `✅ Entrega confirmada! Frete: *R$ ${session.data.freightPrice.toFixed(2).replace('.', ',')}* (${session.data.distanceKm} km)\n\nO que será entregue?\nEx: _documento, caixa pequena, roupa, eletrônico, remédio..._`);
       break;
     }
 
-    case 'confirm_order': {
-      // Groq às vezes pula o calculate_freight e vai direto para confirm_order.
-      // Se o frete ainda não foi calculado, calculamos aqui antes de continuar.
-      if (!session.data.freightPrice) {
-        if (!session.data.pickupAddress || !session.data.deliveryAddress) {
-          await sendWhatsApp(phone, '⚠️ Preciso dos endereços de retirada e entrega para calcular o frete.');
-          return;
-        }
-        await sendWhatsApp(phone, '⏳ Calculando frete...');
-        const pickup = session.data.pickupCoords || await geocode(session.data.pickupAddress);
-        const dest   = await geocode(session.data.deliveryAddress);
-        if (!pickup || !dest) {
-          await sendWhatsApp(phone, '❌ Não consegui encontrar um dos endereços. Pode confirmar com rua, número e cidade?');
-          return;
-        }
-        const km = await getRoadDistanceKm(pickup, dest);
-        if (!km) {
-          await sendWhatsApp(phone, '❌ Não consegui calcular a rota. Tente informar os endereços novamente.');
-          return;
-        }
-        session.data.pickupCoords   = pickup;
-        session.data.deliveryCoords = dest;
-        session.data.distanceKm     = Math.round(km * 10) / 10;
-        session.data.freightPrice   = calcFreight(km);
-        const pickupLine = session.isReturning ? 'Mesmo local da última vez ✅' : session.data.pickupAddress;
-        const summary = `📦 *Resumo da entrega:*\n\n👤 *Cliente:* ${session.data.name}\n🏪 *Retirada:* ${pickupLine}\n📍 *Entrega:* ${session.data.deliveryAddress}\n📏 *Distância:* ${session.data.distanceKm} km\n💰 *Frete:* R$ ${session.data.freightPrice.toFixed(2).replace('.', ',')}${session.data.note ? `\n📝 *Obs:* ${session.data.note}` : ''}\n\nConfirma o pedido? Responda *SIM* para solicitar o motoboy.`;
-        session.history.push({ role: 'assistant', content: summary });
-        sessions.set(phone, session);
-        await sendWhatsApp(phone, summary);
+    case 'collect_package': {
+      const parsed      = await aiParse(msg, 'Extraia o tipo de objeto ou pacote a ser entregue. Retorne: {"package": "tipo extraído e resumido ou null"}');
+      const packageType = (parsed?.package || msg).trim();
+      if (!packageType || packageType.length < 2) {
+        await sendWhatsApp(phone, 'Por favor, descreva o que será entregue (ex: documento, caixa, roupa...).');
         return;
       }
-
-      await sendWhatsApp(phone, aiReply.message);
-
-      const orderId = uuidv4().slice(0, 8).toUpperCase();
-      const order = {
-        orderId, phone,
-        establishmentName: session.data.name || 'Cliente',
-        pickupAddress:     session.data.pickupAddress,
-        pickupCoords:      session.data.pickupCoords,
-        deliveryAddress:   session.data.deliveryAddress,
-        deliveryCoords:    session.data.deliveryCoords,
-        note:              session.data.note || '',
-        distanceKm:        session.data.distanceKm,
-        freightPrice:      session.data.freightPrice,
-        paymentId: null, requestId: null,
-        status: 'pending',
-        createdAt: new Date().toISOString(),
-      };
-      orders.set(orderId, order);
-      await dbSaveOrder(order);
-      sessions.delete(phone); // libera sessão — pedido já foi criado
-      await createRequestFromOrder(orderId);
+      session.data.packageType = packageType;
+      session.state            = 'collect_note';
+      sessions.set(phone, session);
+      await sendWhatsApp(phone, `Tem alguma *observação* para o entregador?\nEx: _portão preto_, _ligar antes_, _frágil_\n\nOu responda *NÃO* para pular.`);
       break;
     }
 
-    case 'cancel':
-      sessions.delete(phone);
-      await sendWhatsApp(phone, aiReply.message);
+    case 'collect_note': {
+      const parsed = await aiParse(msg, 'O cliente quer pular observações ou tem alguma nota? Retorne: {"skip": true | false, "note": "observação extraída ou null"}');
+      const skip   = parsed?.skip ?? SKIP_RE.test(msg);
+      session.data.note = skip ? '' : (parsed?.note || msg).trim();
+      session.state     = 'confirming';
+      sessions.set(phone, session);
+      await sendWhatsApp(phone, buildSummary(session.data, session.isReturning));
       break;
+    }
+
+    case 'confirming': {
+      const parsed = await aiParse(msg, 'O cliente está confirmando (sim) ou cancelando (não) o pedido? Retorne: {"intent": "confirm" | "cancel" | "unclear"}');
+      const intent = parsed?.intent ?? (YES_RE.test(msg) ? 'confirm' : NO_RE.test(msg) ? 'cancel' : 'unclear');
+      if (intent === 'confirm') {
+        const orderId = uuidv4().slice(0, 8).toUpperCase();
+        const order = {
+          orderId, phone,
+          establishmentName: session.data.name,
+          pickupAddress:     session.data.pickupAddress,
+          pickupCoords:      session.data.pickupCoords,
+          deliveryAddress:   session.data.deliveryAddress,
+          deliveryCoords:    session.data.deliveryCoords,
+          packageType:       session.data.packageType,
+          note:              session.data.note || '',
+          distanceKm:        session.data.distanceKm,
+          freightPrice:      session.data.freightPrice,
+          requestId: null,
+          status: 'pending',
+          createdAt: new Date().toISOString(),
+        };
+        orders.set(orderId, order);
+        await dbSaveOrder(order);
+        session.state   = 'waiting_driver';
+        session.orderId = orderId;
+        sessions.set(phone, session);
+        await sendWhatsApp(phone, `✅ *Pedido #${orderId} registrado!*\n\n🔍 Buscando entregador disponível...\nVocê será avisado assim que um motoboy aceitar.\n\nPara cancelar, responda *CANCELAR*.`);
+        await createRequestFromOrder(orderId);
+      } else if (intent === 'cancel') {
+        sessions.delete(phone);
+        await sendWhatsApp(phone, '❌ Pedido cancelado. Quando precisar é só chamar! 😊');
+      } else {
+        await sendWhatsApp(phone, 'Responda *SIM* para confirmar o pedido ou *NÃO* para cancelar.');
+      }
+      break;
+    }
+
+    case 'waiting_driver': {
+      if (CANCEL_RE.test(msg)) {
+        const order = orders.get(session.orderId);
+        if (order && order.status === 'pending') {
+          order.status = 'cancelled';
+          await dbUpdateOrder(order.orderId, { status: 'cancelled' });
+          if (order.requestId) {
+            const req = pendingRequests.get(order.requestId);
+            if (req) req.status = 'cancelled';
+            io.emit('request-taken', { requestId: order.requestId });
+          }
+          sessions.delete(phone);
+          await sendWhatsApp(phone, '❌ Pedido cancelado. Quando precisar é só chamar! 😊');
+        } else {
+          sessions.delete(phone);
+          await sendWhatsApp(phone, '⚠️ Seu pedido já foi aceito por um entregador e não pode ser cancelado.');
+        }
+      } else {
+        await sendWhatsApp(phone, `🔍 Ainda buscando um entregador para seu pedido *#${session.orderId}*.\n\nVocê será avisado assim que alguém aceitar.\n\nPara cancelar, responda *CANCELAR*.`);
+      }
+      break;
+    }
+
+    case 'in_transit': {
+      const order = orders.get(session.orderId);
+      const trackingUrl = order?.deliveryId ? `${HOST_URL}/track/${order.deliveryId}` : null;
+      await sendWhatsApp(phone, `🛵 Seu pedido *#${session.orderId}* está em andamento.${trackingUrl ? `\n\n📍 Rastreie em: ${trackingUrl}` : ''}`);
+      break;
+    }
 
     default:
-      await sendWhatsApp(phone, aiReply.message);
-      break;
+      sessions.delete(phone);
+      await sendWhatsApp(phone, `Olá! 👋 Mande qualquer mensagem para começar um novo pedido pelo *ZAP Entregas*. 🛵`);
   }
 }
 
@@ -699,8 +640,8 @@ function requireAdmin(req, res, next) {
   next();
 }
 
-const STATUS_LABEL = { awaiting_payment: '⏳ Aguardando PIX', pix_error: '⚠️ Erro PIX', paid: '💳 Pago', pending: '🔍 Aguardando motoboy', delivering: '🛵 Em entrega', cancelled: '❌ Cancelado', completed: '✅ Concluído' };
-const STATUS_CSS   = { awaiting_payment: 'yellow', pix_error: 'red', paid: 'blue', pending: 'orange', delivering: 'green', cancelled: 'red', completed: 'darkgreen' };
+const STATUS_LABEL = { pending: '🔍 Aguardando motoboy', accepted: '✅ Motoboy aceito', in_transit: '🛵 Em entrega', cancelled: '❌ Cancelado', completed: '✅ Concluído' };
+const STATUS_CSS   = { pending: 'orange', accepted: 'blue', in_transit: 'green', cancelled: 'red', completed: 'darkgreen' };
 
 app.get('/painel', (req, res) => {
   const key = req.headers['x-admin-key'] || req.query.key;
@@ -709,8 +650,8 @@ app.get('/painel', (req, res) => {
   const all  = [...orders.values()].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
   const stats = {
     total:      all.length,
-    aguardando: all.filter(o => o.status === 'awaiting_payment').length,
-    entrega:    all.filter(o => o.status === 'delivering').length,
+    aguardando: all.filter(o => o.status === 'pending').length,
+    entrega:    all.filter(o => ['accepted', 'in_transit'].includes(o.status)).length,
     cancelados: all.filter(o => o.status === 'cancelled').length,
   };
 
@@ -762,7 +703,7 @@ small{color:#aaa;font-size:.73rem}
 </header>
 <div class="stats">
   <div class="stat"><div class="n">${stats.total}</div><div class="l">Total de pedidos</div></div>
-  <div class="stat"><div class="n">${stats.aguardando}</div><div class="l">Aguardando PIX</div></div>
+  <div class="stat"><div class="n">${stats.aguardando}</div><div class="l">Aguardando motoboy</div></div>
   <div class="stat"><div class="n">${stats.entrega}</div><div class="l">Em entrega</div></div>
   <div class="stat"><div class="n">${stats.cancelados}</div><div class="l">Cancelados</div></div>
 </div>
@@ -832,23 +773,6 @@ app.get('/delivery/:id', (req, res) => {
   res.json({ lastPosition: d.lastPosition, status: d.status });
 });
 
-// ── Webhook Mercado Pago ──────────────────────────────────────────────────────
-app.post('/webhook/mercadopago', async (req, res) => {
-  res.sendStatus(200);
-  const { type, data } = req.body;
-  if (type !== 'payment' || !data?.id) return;
-  const paymentId = String(data.id);
-  const status    = await getPaymentStatus(paymentId);
-  console.log(`💳 MP payment ${paymentId}: ${status}`);
-  if (status !== 'approved') return;
-  const orderId = paymentToOrder.get(paymentId);
-  if (!orderId) return;
-  const order = orders.get(orderId);
-  if (!order || order.status !== 'awaiting_payment') return;
-  order.status = 'paid';
-  await dbUpdateOrder(orderId, { status: 'paid' });
-  await createRequestFromOrder(orderId);
-});
 
 app.get('/health', (_req, res) => res.json({ ok: true, uptime: process.uptime(), whatsapp: waStatus }));
 app.get('/debug',  (_req, res) => res.json({ waStatus, hasQR: !!currentQR, logs: waLogs }));
@@ -873,18 +797,70 @@ io.on('connection', (socket) => {
   });
 
   socket.on('accept-request', async (data) => {
-    const requestId = String(data.requestId || '').toUpperCase();
-    const request   = pendingRequests.get(requestId);
+    const requestId  = String(data.requestId || '').toUpperCase();
+    const driverName = (data.driverName || '').trim() || 'Entregador';
+    const request    = pendingRequests.get(requestId);
     if (!request || request.status !== 'pending') { socket.emit('request-unavailable', { requestId }); return; }
     request.status = 'accepted';
     const deliveryId  = uuidv4().slice(0, 8).toUpperCase();
     const trackingUrl = `${HOST_URL}/track/${deliveryId}`;
-    deliveries.set(deliveryId, { lastPosition: null, history: [], status: 'active', phone: request.phone, createdAt: new Date().toISOString() });
-    if (request.orderId) { const o = orders.get(request.orderId); if (o) { o.status = 'delivering'; o.deliveryId = deliveryId; dbUpdateOrder(request.orderId, { status: 'delivering' }); } }
-    socket.emit('delivery-assigned', { deliveryId, trackingUrl });
+    deliveries.set(deliveryId, { lastPosition: null, history: [], status: 'active', phone: request.phone, driverName, createdAt: new Date().toISOString() });
+    if (request.orderId) {
+      const o = orders.get(request.orderId);
+      if (o) {
+        o.status     = 'accepted';
+        o.deliveryId = deliveryId;
+        o.driverName = driverName;
+        dbUpdateOrder(request.orderId, { status: 'accepted', delivery_id: deliveryId, driver_name: driverName });
+      }
+    }
+    socket.emit('delivery-assigned', { deliveryId, trackingUrl, requestId });
     socket.broadcast.emit('request-taken', { requestId });
-    console.log(`✅ Corrida #${requestId} → Entrega #${deliveryId}`);
-    if (request.phone) await sendWhatsApp(request.phone, `🛵 *Motoboy a caminho!*\n\nRastreie em tempo real:\n${trackingUrl}\n\n_Atualiza automaticamente._`);
+    console.log(`✅ Corrida #${requestId} → Entrega #${deliveryId} (${driverName})`);
+    if (request.phone) {
+      // Atualiza sessão do cliente para in_transit
+      const sess = sessions.get(request.phone);
+      if (sess && sess.state === 'waiting_driver') {
+        sess.state      = 'in_transit';
+        sess.deliveryId = deliveryId;
+        sessions.set(request.phone, sess);
+      }
+      await sendWhatsApp(request.phone, `🛵 *Entregador a caminho!*\n\n👤 *${driverName}* vai buscar seu pacote em breve.\n\n📍 Acompanhe em tempo real:\n${trackingUrl}\n\n_O link atualiza automaticamente._`);
+    }
+  });
+
+  socket.on('pickup-confirmed', async (data) => {
+    const deliveryId = String(data.deliveryId || '').toUpperCase();
+    const d = deliveries.get(deliveryId);
+    if (!d) return;
+    d.status = 'in_transit';
+    const order = [...orders.values()].find(o => o.deliveryId === deliveryId);
+    if (order) {
+      order.status = 'in_transit';
+      dbUpdateOrder(order.orderId, { status: 'in_transit' });
+      if (order.phone) {
+        const trackingUrl = `${HOST_URL}/track/${deliveryId}`;
+        await sendWhatsApp(order.phone, `📦 *Pacote retirado!*\n\n${d.driverName || 'O entregador'} já coletou seu pacote e está a caminho do destino.\n\n📍 Acompanhe: ${trackingUrl}`);
+      }
+    }
+    socket.emit('pickup-ack', { deliveryId });
+  });
+
+  socket.on('delivery-completed', async (data) => {
+    const deliveryId = String(data.deliveryId || '').toUpperCase();
+    const d = deliveries.get(deliveryId);
+    if (!d) return;
+    d.status = 'completed';
+    const order = [...orders.values()].find(o => o.deliveryId === deliveryId);
+    if (order) {
+      order.status = 'completed';
+      dbUpdateOrder(order.orderId, { status: 'completed' });
+      if (order.phone) {
+        sessions.delete(order.phone);
+        await sendWhatsApp(order.phone, `✅ *Entrega concluída!*\n\nSeu pacote foi entregue com sucesso. Obrigado por usar o *ZAP Entregas*! 🛵\n\nQualquer coisa é só chamar. 😊`);
+      }
+    }
+    socket.emit('delivery-complete-ack', { deliveryId });
   });
 
   socket.on('location-update-mobile', (data) => {
@@ -911,7 +887,6 @@ server.listen(PORT, async () => {
   console.log(`\n🚚 Delivery Tracker — ${HOST_URL}`);
   console.log(`   QR Code:  ${HOST_URL}/qr`);
   console.log(`   Admin:    ${HOST_URL}/admin/establishment\n`);
-  if (!MP_TOKEN) console.log('⚠️  MERCADOPAGO_ACCESS_TOKEN não configurado');
   await dbInit();
   connectWA();
 });
