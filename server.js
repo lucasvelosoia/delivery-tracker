@@ -366,7 +366,7 @@ async function geocodePhoton(addr) {
   } catch { return null; }
 }
 
-// Orquestrador: CEP → Google → Mapbox → Nominatim → Photon
+// Orquestrador: CEP → Mapbox → Google → Nominatim → Photon
 async function geocode(address) {
   if (!address) return null;
   const addr = address.trim();
@@ -376,8 +376,8 @@ async function geocode(address) {
   const query       = cepExpanded || addr;
 
   return (
-    (await geocodeGoogle(query))    ||
     (await geocodeMapbox(query))    ||
+    (await geocodeGoogle(query))    ||
     (await geocodeNominatim(query)) ||
     (await geocodePhoton(query))    ||
     null
