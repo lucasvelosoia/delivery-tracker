@@ -462,6 +462,16 @@ async function aiParse(userMsg, instruction) {
   } catch { return null; }
 }
 
+// Valida e normaliza endereço via IA. Retorna null se aiParse indisponível.
+async function parseAddress(msg) {
+  return aiParse(msg,
+    'Normalize o endereço brasileiro para o formato "Logradouro, Número, Bairro, Cidade, UF". ' +
+    'Verifique se tem os elementos MÍNIMOS: (1) número ou ponto de referência e (2) cidade. ' +
+    'Se CEP presente resolva ele para logradouro+bairro+cidade. ' +
+    'Retorne JSON: {"address": "endereço normalizado ou null", "complete": true | false, "missing": ["campo faltante 1", ...]}'
+  );
+}
+
 // ── Bot — máquina de estado (fluxo e cálculos 100% server-side) ──────────────
 const YES_RE    = /^(s|si|sim|yes|pode|pode ser|isso|isso mesmo|mesmo|ok|claro|tá|ta|tá bom|ta bom|confirma|confirmado|quero|vai|bora|manda)\s*[!.]*$/i;
 const NO_RE     = /^(n|nao|não|nope|nop|cancel|cancelar|desistir|para)\s*[!.]*$/i;
@@ -534,7 +544,13 @@ async function handleBotMessage(phone, text) {
         sessions.set(phone, session);
         await sendWhatsApp(phone, `✅ Perfeito! Retirada no mesmo local.\n\nQual é o endereço de *entrega*?\nEx: _Av. Paulista, 1000, Bela Vista, São Paulo_`);
       } else {
-        const rawAddress = parsed?.address || msg;
+        const addrParsed = await parseAddress(msg);
+        if (addrParsed && !addrParsed.complete) {
+          const missing = addrParsed.missing?.join(' e ') || 'cidade';
+          await sendWhatsApp(phone, `📍 Falta *${missing}* no endereço. Pode completar?\nEx: _Rua das Flores, 123, Centro, São Paulo_\n\nOu responda *SIM* para usar o mesmo local anterior.`);
+          return;
+        }
+        const rawAddress = addrParsed?.address || msg;
         await sendWhatsApp(phone, `⏳ Verificando endereço de retirada...`);
         const coords = await geocode(rawAddress);
         if (!coords) {
@@ -552,12 +568,13 @@ async function handleBotMessage(phone, text) {
     }
 
     case 'collect_pickup': {
-      const parsed     = await aiParse(msg,
-        'Normalize o endereço brasileiro para o formato "Logradouro, Número, Bairro, Cidade, UF". ' +
-        'Se CEP presente inclua. Infira cidade/estado pelo contexto quando óbvio. ' +
-        'Retorne JSON: {"address": "endereço normalizado completo ou null"}'
-      );
-      const rawAddress = parsed?.address || msg;
+      const addrParsed = await parseAddress(msg);
+      if (addrParsed && !addrParsed.complete) {
+        const missing = addrParsed.missing?.join(' e ') || 'cidade';
+        await sendWhatsApp(phone, `📍 Falta *${missing}* no endereço. Pode completar?\nEx: _Rua das Flores, 123, Centro, São Paulo_`);
+        return;
+      }
+      const rawAddress = addrParsed?.address || msg;
       await sendWhatsApp(phone, `⏳ Verificando endereço de retirada...`);
       const coords = await geocode(rawAddress);
       if (!coords) {
@@ -573,12 +590,13 @@ async function handleBotMessage(phone, text) {
     }
 
     case 'collect_delivery': {
-      const parsed     = await aiParse(msg,
-        'Normalize o endereço brasileiro para o formato "Logradouro, Número, Bairro, Cidade, UF". ' +
-        'Se CEP presente inclua. Infira cidade/estado pelo contexto quando óbvio. ' +
-        'Retorne JSON: {"address": "endereço normalizado completo ou null"}'
-      );
-      const rawAddress = parsed?.address || msg;
+      const addrParsed = await parseAddress(msg);
+      if (addrParsed && !addrParsed.complete) {
+        const missing = addrParsed.missing?.join(' e ') || 'cidade';
+        await sendWhatsApp(phone, `📍 Falta *${missing}* no endereço de entrega. Pode completar?\nEx: _Av. Paulista, 1000, Bela Vista, São Paulo_`);
+        return;
+      }
+      const rawAddress = addrParsed?.address || msg;
       await sendWhatsApp(phone, `⏳ Verificando endereço e calculando frete...`);
       const dest = await geocode(rawAddress);
       if (!dest) {
