@@ -97,6 +97,10 @@ async function dbInit() {
       created_at      TIMESTAMPTZ DEFAULT NOW()
     );
     ALTER TABLE partners ADD COLUMN IF NOT EXISTS activation_code TEXT UNIQUE;
+    CREATE TABLE IF NOT EXISTS partner_phones (
+      phone         TEXT PRIMARY KEY,
+      partner_phone TEXT NOT NULL
+    );
   `);
   const rows = await db.query('SELECT * FROM establishments');
   for (const r of rows.rows)
@@ -111,8 +115,17 @@ async function dbInit() {
   for (const r of driverRows.rows)
     drivers.set(r.phone, { phone: r.phone, name: r.name, active: r.active, createdAt: r.created_at?.toISOString?.() || r.created_at });
   const partnerRows = await db.query('SELECT * FROM partners ORDER BY created_at DESC');
-  for (const r of partnerRows.rows)
-    registerPartner({ phone: r.phone, name: r.name, pickupAddress: r.pickup_address, pickupCoords: { lat: r.pickup_lat, lng: r.pickup_lng }, defaultPackage: r.default_package, activationCode: r.activation_code || null, createdAt: r.created_at?.toISOString?.() || r.created_at });
+  const partnerMap  = new Map();
+  for (const r of partnerRows.rows) {
+    const p = { phone: r.phone, name: r.name, pickupAddress: r.pickup_address, pickupCoords: { lat: r.pickup_lat, lng: r.pickup_lng }, defaultPackage: r.default_package, activationCode: r.activation_code || null, createdAt: r.created_at?.toISOString?.() || r.created_at };
+    partnerMap.set(r.phone, p);
+    registerPartner(p);
+  }
+  const phoneRows = await db.query('SELECT * FROM partner_phones');
+  for (const r of phoneRows.rows) {
+    const original = partnerMap.get(r.partner_phone);
+    if (original) registerPartner({ ...original, phone: r.phone });
+  }
   console.log(`✅ PostgreSQL conectado — ${rows.rows.length} estabelecimento(s), ${clientRows.rows.length} cliente(s), ${orderRows.rows.length} pedido(s), ${driverRows.rows.length} entregador(es), ${partnerRows.rows.length} parceiro(s)`);
 }
 
@@ -554,9 +567,16 @@ async function handleBotMessage(phone, text, opts = {}) {
   const codePartner = msg ? partnerCodes.get(msg.toLowerCase()) : null;
   if (codePartner) {
     sessions.delete(phone);
+    // Persistir número para reconhecimento futuro sem código
+    const cleanPhone = phone.replace(/\D/g, '');
+    registerPartner({ ...codePartner, phone: cleanPhone });
+    if (db) await db.query(
+      'INSERT INTO partner_phones(phone, partner_phone) VALUES($1,$2) ON CONFLICT(phone) DO NOTHING',
+      [cleanPhone, codePartner.phone]
+    ).catch(e => console.error('savePartnerPhone:', e.message));
     const s = { state: 'collect_delivery', data: { name: codePartner.name, pickupAddress: codePartner.pickupAddress, pickupCoords: codePartner.pickupCoords, packageType: codePartner.defaultPackage }, isPartner: true };
     sessions.set(phone, s);
-    await sendWhatsApp(phone, `✅ Modo parceiro ativado! Olá, *${codePartner.name}*! 😊\n\nMande a foto do pedido com o endereço na legenda, ou só o endereço de entrega.`);
+    await sendWhatsApp(phone, `✅ Modo parceiro ativado! Olá, *${codePartner.name}*! 😊\n\nEste número já será reconhecido automaticamente. Mande a foto do pedido com o endereço na legenda, ou só o endereço de entrega.`);
     return;
   }
 
