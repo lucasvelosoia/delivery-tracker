@@ -968,7 +968,8 @@ small{color:#aaa;font-size:.73rem}
 <header>
   <h1>🛵 ZAP Entregas — Painel</h1>
   <small id="clock">${new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })}</small>
-  <button class="btn btn-red" onclick="clearSessions()">🧹 Limpar Memória</button>
+  <button class="btn btn-red" onclick="clearSessions()">🧹 Limpar Sessões</button>
+  <button class="btn btn-red" onclick="clearAll()" style="background:#7f1d1d">🗑️ Limpar Tudo</button>
 </header>
 
 <div class="stats">
@@ -1085,10 +1086,18 @@ async function removePartner(phone) {
 }
 
 async function clearSessions() {
-  if (!confirm('Limpar toda a memória de conversas ativas?')) return;
+  if (!confirm('Limpar todas as conversas ativas?')) return;
   const res = await api('POST', '/admin/clear-sessions');
-  if (res.ok) toast('Memória limpa — ' + res.cleared + ' sessão(ões) removida(s).');
+  if (res.ok) toast('Sessões limpas — ' + res.cleared + ' removida(s).');
   else toast('Erro', false);
+}
+
+async function clearAll() {
+  if (!confirm('⚠️ Isso apaga TODAS as sessões e TODO o histórico de pedidos do banco. Continuar?')) return;
+  const res = await api('POST', '/admin/clear-all');
+  if (res.ok) toast('Reset completo: ' + res.sessions + ' sessao(oes) e ' + res.orders + ' pedido(s) apagados.');
+  else toast('Erro', false);
+  setTimeout(() => location.reload(), 1500);
 }
 
 // Atualiza pedidos automaticamente sem reload completo
@@ -1147,6 +1156,17 @@ app.post('/admin/clear-sessions', requireAdmin, (_req, res) => {
   sessions.clear();
   console.log(`🧹 Sessões limpas (${count} removidas)`);
   res.json({ ok: true, cleared: count });
+});
+
+app.post('/admin/clear-all', requireAdmin, async (_req, res) => {
+  const sessionCount = sessions.size;
+  const orderCount   = orders.size;
+  sessions.clear();
+  orders.clear();
+  pendingRequests.clear();
+  if (db) await db.query('DELETE FROM pedidos').catch(e => console.error('clear-all pedidos:', e.message));
+  console.log(`🧹 Reset total — ${sessionCount} sessão(ões), ${orderCount} pedido(s) removidos`);
+  res.json({ ok: true, sessions: sessionCount, orders: orderCount });
 });
 
 app.get('/admin/partners', requireAdmin, (_req, res) =>
