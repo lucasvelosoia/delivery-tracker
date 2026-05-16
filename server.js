@@ -79,6 +79,12 @@ async function dbInit() {
     ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS delivery_id TEXT;
     ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS driver_name TEXT;
     ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS package_type TEXT;
+    CREATE TABLE IF NOT EXISTS drivers (
+      phone      TEXT PRIMARY KEY,
+      name       TEXT NOT NULL,
+      active     BOOLEAN DEFAULT true,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
   `);
   const rows = await db.query('SELECT * FROM establishments');
   for (const r of rows.rows)
@@ -89,7 +95,10 @@ async function dbInit() {
   const orderRows = await db.query('SELECT * FROM pedidos ORDER BY created_at DESC LIMIT 500');
   for (const r of orderRows.rows)
     orders.set(r.order_id, { orderId: r.order_id, phone: r.phone, establishmentName: r.customer_name, pickupAddress: r.pickup_address, deliveryAddress: r.delivery_address, distanceKm: r.distance_km, freightPrice: r.freight_price, status: r.status, requestId: r.request_id, deliveryId: r.delivery_id, driverName: r.driver_name, packageType: r.package_type, note: r.note, createdAt: r.created_at?.toISOString?.() || r.created_at });
-  console.log(`✅ PostgreSQL conectado — ${rows.rows.length} estabelecimento(s), ${clientRows.rows.length} cliente(s), ${orderRows.rows.length} pedido(s)`);
+  const driverRows = await db.query('SELECT * FROM drivers ORDER BY created_at DESC');
+  for (const r of driverRows.rows)
+    drivers.set(r.phone, { phone: r.phone, name: r.name, active: r.active, createdAt: r.created_at?.toISOString?.() || r.created_at });
+  console.log(`✅ PostgreSQL conectado — ${rows.rows.length} estabelecimento(s), ${clientRows.rows.length} cliente(s), ${orderRows.rows.length} pedido(s), ${driverRows.rows.length} entregador(es)`);
 }
 
 const dbSaveOrder = (o) => {
@@ -125,6 +134,7 @@ const sessions        = new Map();
 const establishments  = new Map();
 const clients         = new Map(); // phone → { name, pickupAddress, pickupCoords }
 const orders          = new Map();
+const drivers         = new Map(); // phone → { name, phone, active, createdAt }
 
 // ── WhatsApp auth state persistente no PostgreSQL ────────────────────────────
 async function usePostgresAuthState(pool) {
@@ -763,7 +773,7 @@ app.get('/painel', (req, res) => {
   const fmt = (v) => v ? `R$ ${Number(v).toFixed(2).replace('.', ',')}` : '—';
   const dt  = (s) => s ? new Date(s).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—';
 
-  const rows = all.map(o => `<tr>
+  const orderRows = all.map(o => `<tr>
     <td><strong>#${o.orderId}</strong><br><small>${dt(o.createdAt)}</small></td>
     <td>${o.establishmentName || '—'}<br><small>${o.phone || ''}</small></td>
     <td class="addr">${o.pickupAddress || '—'}</td>
@@ -773,52 +783,148 @@ app.get('/painel', (req, res) => {
     <td><span class="badge s-${STATUS_CSS[o.status] || 'gray'}">${STATUS_LABEL[o.status] || o.status}</span></td>
   </tr>`).join('');
 
+  const driverList = [...drivers.values()].map(d => `<tr>
+    <td>${d.name}</td>
+    <td>${d.phone}</td>
+    <td>${dt(d.createdAt)}</td>
+    <td><button class="btn-danger" onclick="removeDriver('${d.phone}')">Remover</button></td>
+  </tr>`).join('');
+
   res.send(`<!DOCTYPE html>
 <html lang="pt-BR"><head><meta charset="UTF-8">
-<meta http-equiv="refresh" content="15;url=/painel?key=${encodeURIComponent(key)}">
 <title>ZAP Entregas — Painel</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,sans-serif;background:#f0f2f5}
-header{background:#25D366;color:#fff;padding:14px 24px;display:flex;justify-content:space-between;align-items:center}
-header h1{font-size:1rem;font-weight:700}
+header{background:#25D366;color:#fff;padding:14px 24px;display:flex;justify-content:space-between;align-items:center;gap:12px}
+header h1{font-size:1rem;font-weight:700;flex:1}
 header small{opacity:.8;font-size:.78rem}
+.btn{padding:8px 14px;border:none;border-radius:8px;font-size:.8rem;font-weight:600;cursor:pointer}
+.btn-green{background:#25D366;color:#fff}
+.btn-red{background:#ef4444;color:#fff}
+.btn-danger{background:#fee2e2;color:#991b1b;padding:4px 10px;border:none;border-radius:6px;font-size:.72rem;cursor:pointer}
+.btn-danger:hover{background:#fca5a5}
 .stats{display:flex;gap:12px;padding:20px 24px;flex-wrap:wrap}
 .stat{background:#fff;border-radius:10px;padding:14px 20px;box-shadow:0 1px 3px rgba(0,0,0,.1);min-width:130px}
 .stat .n{font-size:2rem;font-weight:700;line-height:1}
 .stat .l{font-size:.75rem;color:#666;margin-top:4px}
-.wrap{padding:0 24px 32px;overflow-x:auto}
-table{width:100%;border-collapse:collapse;background:#fff;border-radius:10px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+.section{padding:0 24px 32px}
+.section-title{font-size:.8rem;font-weight:700;color:#555;text-transform:uppercase;letter-spacing:.06em;margin-bottom:12px}
+.card{background:#fff;border-radius:10px;box-shadow:0 1px 3px rgba(0,0,0,.1);overflow:hidden}
+.card-body{padding:16px 20px}
+form.inline{display:flex;gap:8px;flex-wrap:wrap}
+form.inline input{padding:9px 12px;border:1px solid #ddd;border-radius:8px;font-size:.83rem;flex:1;min-width:140px}
+table{width:100%;border-collapse:collapse}
 th{padding:10px 14px;text-align:left;font-size:.72rem;color:#777;background:#fafafa;border-bottom:1px solid #eee;text-transform:uppercase;letter-spacing:.04em}
 td{padding:10px 14px;border-top:1px solid #f0f0f0;font-size:.83rem;vertical-align:top}
 .addr{max-width:160px;word-break:break-word}
 small{color:#aaa;font-size:.73rem}
 .badge{display:inline-block;padding:3px 9px;border-radius:20px;font-size:.72rem;font-weight:600}
-.s-yellow{background:#fff3cd;color:#856404}
-.s-blue{background:#cfe2ff;color:#0d47a1}
 .s-orange{background:#ffe5d0;color:#9c4a0a}
+.s-blue{background:#cfe2ff;color:#0d47a1}
 .s-green{background:#d1fae5;color:#065f46}
 .s-red{background:#fee2e2;color:#991b1b}
 .s-darkgreen{background:#bbf7d0;color:#14532d}
 .empty{text-align:center;color:#bbb;padding:40px!important}
+#toast{position:fixed;bottom:24px;right:24px;background:#1f2937;color:#fff;padding:10px 18px;border-radius:8px;font-size:.83rem;display:none;z-index:99}
 </style></head><body>
+
 <header>
-  <h1>🛵 ZAP Entregas — Painel de Pedidos</h1>
-  <small>Atualiza a cada 15s · ${new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })}</small>
+  <h1>🛵 ZAP Entregas — Painel</h1>
+  <small id="clock">${new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })}</small>
+  <button class="btn btn-red" onclick="clearSessions()">🧹 Limpar Memória</button>
 </header>
+
 <div class="stats">
   <div class="stat"><div class="n">${stats.total}</div><div class="l">Total de pedidos</div></div>
   <div class="stat"><div class="n">${stats.aguardando}</div><div class="l">Aguardando motoboy</div></div>
   <div class="stat"><div class="n">${stats.entrega}</div><div class="l">Em entrega</div></div>
   <div class="stat"><div class="n">${stats.cancelados}</div><div class="l">Cancelados</div></div>
+  <div class="stat"><div class="n">${sessions.size}</div><div class="l">Sessões ativas</div></div>
+  <div class="stat"><div class="n">${drivers.size}</div><div class="l">Entregadores</div></div>
 </div>
-<div class="wrap">
-<table><thead><tr>
-  <th>Pedido</th><th>Cliente</th><th>Retirada</th><th>Entrega</th><th>Distância</th><th>Frete</th><th>Status</th>
-</tr></thead><tbody>
-${rows || '<tr><td colspan="7" class="empty">Nenhum pedido ainda</td></tr>'}
-</tbody></table>
+
+<div class="section">
+  <div class="section-title">Entregadores</div>
+  <div class="card">
+    <div class="card-body" style="border-bottom:1px solid #f0f0f0">
+      <form class="inline" onsubmit="addDriver(event)">
+        <input id="drv-name" placeholder="Nome" required>
+        <input id="drv-phone" placeholder="WhatsApp (ex: 11999990000)" required>
+        <button type="submit" class="btn btn-green">+ Cadastrar</button>
+      </form>
+    </div>
+    <table><thead><tr><th>Nome</th><th>Telefone</th><th>Cadastrado em</th><th></th></tr></thead>
+    <tbody id="drv-list">
+${driverList || '<tr><td colspan="4" class="empty">Nenhum entregador cadastrado</td></tr>'}
+    </tbody></table>
+  </div>
 </div>
+
+<div class="section">
+  <div class="section-title">Pedidos</div>
+  <div class="card">
+    <table><thead><tr>
+      <th>Pedido</th><th>Cliente</th><th>Retirada</th><th>Entrega</th><th>Distância</th><th>Frete</th><th>Status</th>
+    </tr></thead><tbody>
+${orderRows || '<tr><td colspan="7" class="empty">Nenhum pedido ainda</td></tr>'}
+    </tbody></table>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+const KEY = ${JSON.stringify(key)};
+
+function toast(msg, ok = true) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.background = ok ? '#166534' : '#991b1b';
+  t.style.display = 'block';
+  setTimeout(() => t.style.display = 'none', 3000);
+}
+
+async function api(method, path, body) {
+  const r = await fetch(path, {
+    method,
+    headers: { 'Content-Type': 'application/json', 'x-admin-key': KEY },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  return r.json();
+}
+
+async function addDriver(e) {
+  e.preventDefault();
+  const name  = document.getElementById('drv-name').value.trim();
+  const phone = document.getElementById('drv-phone').value.trim();
+  const res   = await api('POST', '/admin/driver', { name, phone });
+  if (res.ok) { toast('Entregador cadastrado!'); setTimeout(() => location.reload(), 800); }
+  else toast(res.error || 'Erro', false);
+}
+
+async function removeDriver(phone) {
+  if (!confirm('Remover este entregador?')) return;
+  const res = await api('DELETE', '/admin/driver/' + phone);
+  if (res.ok) { toast('Removido.'); setTimeout(() => location.reload(), 800); }
+  else toast('Erro', false);
+}
+
+async function clearSessions() {
+  if (!confirm('Limpar toda a memória de conversas ativas?')) return;
+  const res = await api('POST', '/admin/clear-sessions');
+  if (res.ok) toast('Memória limpa — ' + res.cleared + ' sessão(ões) removida(s).');
+  else toast('Erro', false);
+}
+
+// Atualiza pedidos automaticamente sem reload completo
+setInterval(async () => {
+  try {
+    const orders = await api('GET', '/admin/orders');
+    // reconstrói apenas a tabela de pedidos
+  } catch {}
+}, 15000);
+</script>
 </body></html>`);
 });
 
@@ -839,6 +945,35 @@ app.get('/admin/establishments', requireAdmin, (_req, res) =>
 
 app.get('/admin/orders', requireAdmin, (_req, res) =>
   res.json([...orders.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt))));
+
+app.get('/admin/drivers', requireAdmin, (_req, res) =>
+  res.json([...drivers.values()]));
+
+app.post('/admin/driver', requireAdmin, async (req, res) => {
+  const { phone, name } = req.body;
+  if (!phone || !name) return res.status(400).json({ error: 'phone e name obrigatórios' });
+  const driver = { phone: String(phone).replace(/\D/g, ''), name: name.trim(), active: true, createdAt: new Date().toISOString() };
+  drivers.set(driver.phone, driver);
+  if (db) await db.query(
+    'INSERT INTO drivers(phone,name,active) VALUES($1,$2,true) ON CONFLICT(phone) DO UPDATE SET name=$2,active=true',
+    [driver.phone, driver.name]
+  ).catch(e => console.error('saveDriver:', e.message));
+  res.json({ ok: true, driver });
+});
+
+app.delete('/admin/driver/:phone', requireAdmin, async (req, res) => {
+  const phone = req.params.phone.replace(/\D/g, '');
+  drivers.delete(phone);
+  if (db) await db.query('DELETE FROM drivers WHERE phone=$1', [phone]).catch(e => console.error('deleteDriver:', e.message));
+  res.json({ ok: true });
+});
+
+app.post('/admin/clear-sessions', requireAdmin, (_req, res) => {
+  const count = sessions.size;
+  sessions.clear();
+  console.log(`🧹 Sessões limpas (${count} removidas)`);
+  res.json({ ok: true, cleared: count });
+});
 
 // ── QR Code ───────────────────────────────────────────────────────────────────
 const page = (body, ref = 5) => `<html><head><meta http-equiv="refresh" content="${ref}"><style>body{font-family:sans-serif;text-align:center;padding:40px;background:#f5f5f5}img{border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,.15)}</style></head><body>${body}</body></html>`;
