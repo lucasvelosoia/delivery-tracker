@@ -521,6 +521,16 @@ function buildSummary(data, isReturning) {
   );
 }
 
+function findPartner(jid) {
+  const digits = jid.replace(/\D/g, '');
+  if (partners.has(digits)) return partners.get(digits);
+  for (const [, val] of partners) {
+    const kd = (val.phone || '').replace(/\D/g, '');
+    if (digits.endsWith(kd) || kd.endsWith(digits)) return val;
+  }
+  return null;
+}
+
 async function handleBotMessage(phone, text, opts = {}) {
   const msg      = text.trim();
   const hasPhoto = opts.hasPhoto || false;
@@ -528,7 +538,7 @@ async function handleBotMessage(phone, text, opts = {}) {
 
   // Se a sessão existe mas não é de parceiro, verifica se o número agora é parceiro
   if (session && !session.isPartner) {
-    const p = partners.get(phone) || partners.get(phone.replace(/\D/g, ''));
+    const p = findPartner(phone);
     if (p) {
       sessions.delete(phone);
       session = null;
@@ -554,7 +564,7 @@ async function handleBotMessage(phone, text, opts = {}) {
 
   // ── Primeira mensagem: sem sessão ──────────────────────────────────────────
   if (!session) {
-    const partner = partners.get(phone) || partners.get(phone.replace(/\D/g, ''));
+    const partner = findPartner(phone);
     if (partner) {
       session = { state: 'collect_delivery', data: { name: partner.name, pickupAddress: partner.pickupAddress, pickupCoords: partner.pickupCoords, packageType: partner.defaultPackage }, isPartner: true };
       sessions.set(phone, session);
@@ -837,7 +847,7 @@ async function handleBotMessage(phone, text, opts = {}) {
         break;
       }
       // Nova foto ou mensagem com endereço — reinicia como nova entrega
-      const p = partners.get(phone);
+      const p = findPartner(phone);
       if (p) {
         session.data = { name: p.name, pickupAddress: p.pickupAddress, pickupCoords: p.pickupCoords, packageType: p.defaultPackage };
       } else {
@@ -1161,12 +1171,17 @@ app.post('/admin/clear-sessions', requireAdmin, (_req, res) => {
 app.post('/admin/clear-all', requireAdmin, async (_req, res) => {
   const sessionCount = sessions.size;
   const orderCount   = orders.size;
+  const clientCount  = clients.size;
   sessions.clear();
   orders.clear();
   pendingRequests.clear();
-  if (db) await db.query('DELETE FROM pedidos').catch(e => console.error('clear-all pedidos:', e.message));
-  console.log(`🧹 Reset total — ${sessionCount} sessão(ões), ${orderCount} pedido(s) removidos`);
-  res.json({ ok: true, sessions: sessionCount, orders: orderCount });
+  clients.clear();
+  if (db) {
+    await db.query('DELETE FROM pedidos').catch(e => console.error('clear-all pedidos:', e.message));
+    await db.query('DELETE FROM clients').catch(e => console.error('clear-all clients:', e.message));
+  }
+  console.log(`🧹 Reset total — ${sessionCount} sessão(ões), ${orderCount} pedido(s), ${clientCount} cliente(s) removidos`);
+  res.json({ ok: true, sessions: sessionCount, orders: orderCount, clients: clientCount });
 });
 
 app.get('/admin/partners', requireAdmin, (_req, res) =>
