@@ -526,6 +526,15 @@ async function handleBotMessage(phone, text, opts = {}) {
   const hasPhoto = opts.hasPhoto || false;
   let session = sessions.get(phone);
 
+  // Se a sessão existe mas não é de parceiro, verifica se o número agora é parceiro
+  if (session && !session.isPartner) {
+    const p = partners.get(phone) || partners.get(phone.replace(/\D/g, ''));
+    if (p) {
+      sessions.delete(phone);
+      session = null;
+    }
+  }
+
   // ── CANCELAR global — encerra qualquer estado ──────────────────────────────
   if (session && CANCEL_RE.test(msg)) {
     const order = session.orderId ? orders.get(session.orderId) : null;
@@ -545,7 +554,7 @@ async function handleBotMessage(phone, text, opts = {}) {
 
   // ── Primeira mensagem: sem sessão ──────────────────────────────────────────
   if (!session) {
-    const partner = partners.get(phone);
+    const partner = partners.get(phone) || partners.get(phone.replace(/\D/g, ''));
     if (partner) {
       session = { state: 'collect_delivery', data: { name: partner.name, pickupAddress: partner.pickupAddress, pickupCoords: partner.pickupCoords, packageType: partner.defaultPackage }, isPartner: true };
       sessions.set(phone, session);
