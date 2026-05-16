@@ -24,6 +24,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 // ── Config ───────────────────────────────────────────────────────────────────
 const HOST_URL  = process.env.HOST_URL
+  || process.env.RENDER_EXTERNAL_URL
   || (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : null)
   || `http://localhost:${process.env.PORT || 3000}`;
 const ADMIN_KEY    = process.env.ADMIN_KEY || 'admin123';
@@ -1106,7 +1107,8 @@ io.on('connection', (socket) => {
         sess.deliveryId = deliveryId;
         sessions.set(request.phone, sess);
       }
-      await sendWhatsApp(request.phone, `🛵 *Entregador a caminho!*\n\n👤 *${driverName}* vai buscar seu pacote em breve.\n\n📍 Acompanhe em tempo real:\n${trackingUrl}\n\n_O link atualiza automaticamente._`);
+      await sendWhatsApp(request.phone, `🛵 *Entregador a caminho!*\n\n👤 *${driverName}* está indo buscar seu pacote.`);
+      await sendWhatsApp(request.phone, `📍 Acompanhe em tempo real:\n${trackingUrl}`);
     }
   });
 
@@ -1121,7 +1123,8 @@ io.on('connection', (socket) => {
       dbUpdateOrder(order.orderId, { status: 'in_transit' });
       if (order.phone) {
         const trackingUrl = `${HOST_URL}/track/${deliveryId}`;
-        await sendWhatsApp(order.phone, `📦 *Pacote retirado!*\n\n${d.driverName || 'O entregador'} já coletou seu pacote e está a caminho do destino.\n\n📍 Acompanhe: ${trackingUrl}`);
+        await sendWhatsApp(order.phone, `📦 *Pacote retirado!*\n\n${d.driverName || 'O entregador'} já coletou seu pacote e está a caminho do destino.`);
+        await sendWhatsApp(order.phone, `📍 Acompanhe em tempo real:\n${trackingUrl}`);
       }
     }
     socket.emit('pickup-ack', { deliveryId });
