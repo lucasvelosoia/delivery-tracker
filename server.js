@@ -110,7 +110,7 @@ async function dbInit() {
     drivers.set(r.phone, { phone: r.phone, name: r.name, active: r.active, createdAt: r.created_at?.toISOString?.() || r.created_at });
   const partnerRows = await db.query('SELECT * FROM partners ORDER BY created_at DESC');
   for (const r of partnerRows.rows)
-    partners.set(r.phone, { phone: r.phone, name: r.name, pickupAddress: r.pickup_address, pickupCoords: { lat: r.pickup_lat, lng: r.pickup_lng }, defaultPackage: r.default_package, createdAt: r.created_at?.toISOString?.() || r.created_at });
+    registerPartner({ phone: r.phone, name: r.name, pickupAddress: r.pickup_address, pickupCoords: { lat: r.pickup_lat, lng: r.pickup_lng }, defaultPackage: r.default_package, createdAt: r.created_at?.toISOString?.() || r.created_at });
   console.log(`✅ PostgreSQL conectado — ${rows.rows.length} estabelecimento(s), ${clientRows.rows.length} cliente(s), ${orderRows.rows.length} pedido(s), ${driverRows.rows.length} entregador(es), ${partnerRows.rows.length} parceiro(s)`);
 }
 
@@ -521,12 +521,22 @@ function buildSummary(data, isReturning) {
   );
 }
 
+function partnerPhoneVariants(phone) {
+  const d = String(phone).replace(/\D/g, '');
+  const variants = new Set([d]);
+  if (d.startsWith('55') && d.length >= 12) variants.add(d.slice(2)); // sem código BR
+  if (!d.startsWith('55') && d.length >= 10) variants.add('55' + d);  // com código BR
+  return variants;
+}
+
+function registerPartner(p) {
+  for (const v of partnerPhoneVariants(p.phone)) partners.set(v, p);
+}
+
 function findPartner(jid) {
   const digits = jid.replace(/\D/g, '');
-  if (partners.has(digits)) return partners.get(digits);
-  for (const [, val] of partners) {
-    const kd = (val.phone || '').replace(/\D/g, '');
-    if (digits.endsWith(kd) || kd.endsWith(digits)) return val;
+  for (const v of partnerPhoneVariants(digits)) {
+    if (partners.has(v)) return partners.get(v);
   }
   return null;
 }
@@ -1194,7 +1204,7 @@ app.post('/admin/partner', requireAdmin, async (req, res) => {
   const coords = await geocode(pickupAddress);
   if (!coords) return res.status(400).json({ error: 'Não foi possível geocodificar o endereço de retirada' });
   const partner = { phone: String(phone).replace(/\D/g, ''), name: name.trim(), pickupAddress, pickupCoords: coords, defaultPackage, createdAt: new Date().toISOString() };
-  partners.set(partner.phone, partner);
+  registerPartner(partner);
   if (db) await db.query(
     'INSERT INTO partners(phone,name,pickup_address,pickup_lat,pickup_lng,default_package) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(phone) DO UPDATE SET name=$2,pickup_address=$3,pickup_lat=$4,pickup_lng=$5,default_package=$6',
     [partner.phone, partner.name, partner.pickupAddress, coords.lat, coords.lng, partner.defaultPackage]
