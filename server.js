@@ -465,10 +465,11 @@ async function aiParse(userMsg, instruction) {
 // Valida e normaliza endereço via IA. Retorna null se aiParse indisponível.
 async function parseAddress(msg) {
   return aiParse(msg,
-    'Normalize o endereço brasileiro para o formato "Logradouro, Número, Bairro, Cidade, UF". ' +
-    'Verifique se tem os elementos MÍNIMOS: (1) número ou ponto de referência e (2) cidade. ' +
-    'Se CEP presente resolva ele para logradouro+bairro+cidade. ' +
-    'Retorne JSON: {"address": "endereço normalizado ou null", "complete": true | false, "missing": ["campo faltante 1", ...]}'
+    'Extraia e normalize o local de retirada ou entrega. Pode ser endereço convencional, ' +
+    'nome de estabelecimento, ponto de referência ou qualquer combinação — número NÃO é obrigatório. ' +
+    'Se CEP presente, expanda para logradouro+bairro+cidade. ' +
+    'O ÚNICO campo obrigatório para complete=true é que haja uma cidade ou localidade identificável. ' +
+    'Retorne JSON: {"address": "local normalizado com cidade ou null", "complete": true | false, "missing": ["cidade"]}'
   );
 }
 
