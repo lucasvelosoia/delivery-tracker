@@ -271,16 +271,17 @@ async function connectWA() {
       for (const msg of messages) {
         const jid    = msg.key.remoteJid || '';
         const fromMe = msg.key.fromMe;
-        const text   = msg.message?.conversation
+        const isPhoto = !!msg.message?.imageMessage;
+        const text    = msg.message?.conversation
           || msg.message?.extendedTextMessage?.text
           || msg.message?.imageMessage?.caption
           || '';
-        waLog(`  jid=${jid} fromMe=${fromMe} type=${type} text="${text.slice(0,30)}"`);
+        waLog(`  jid=${jid} fromMe=${fromMe} type=${type} isPhoto=${isPhoto} text="${text.slice(0,30)}"`);
         if (fromMe) continue;
         if (jid.endsWith('@g.us')) continue;
         if (type !== 'notify') continue;
-        if (!jid || !text) continue;
-        handleBotMessage(jid, text).catch(async (e) => {
+        if (!jid || (!text && !isPhoto)) continue;
+        handleBotMessage(jid, text, { hasPhoto: isPhoto }).catch(async (e) => {
           console.error('Bot error:', e.message);
           await sendWhatsApp(jid, '⚠️ Erro interno. Tente novamente em instantes.').catch(() => {});
         });
@@ -520,8 +521,9 @@ function buildSummary(data, isReturning) {
   );
 }
 
-async function handleBotMessage(phone, text) {
-  const msg = text.trim();
+async function handleBotMessage(phone, text, opts = {}) {
+  const msg      = text.trim();
+  const hasPhoto = opts.hasPhoto || false;
   let session = sessions.get(phone);
 
   // ── CANCELAR global — encerra qualquer estado ──────────────────────────────
@@ -547,20 +549,28 @@ async function handleBotMessage(phone, text) {
     if (partner) {
       session = { state: 'collect_delivery', data: { name: partner.name, pickupAddress: partner.pickupAddress, pickupCoords: partner.pickupCoords, packageType: partner.defaultPackage }, isPartner: true };
       sessions.set(phone, session);
-      await sendWhatsApp(phone, `Olá, *${partner.name}*! 😊\n\nPara onde vai a entrega?\nEx: _Rua das Flores, 123, Centro, Bragança Paulista_`);
+      if (!msg) {
+        // Foto sem legenda ou mensagem vazia — pede o endereço
+        const saudacao = `Olá, *${partner.name}*! 😊`;
+        await sendWhatsApp(phone, hasPhoto
+          ? `${saudacao}\n\nRecebi a foto! 📸 Qual é o endereço de entrega?`
+          : `${saudacao}\n\nMande a foto do pedido com o endereço na legenda, ou só o endereço de entrega.`);
+        return;
+      }
+      // Tem texto (legenda da foto ou mensagem direta) — cai no state machine abaixo
+    } else {
+      const known = clients.get(phone);
+      if (known) {
+        session = { state: 'confirm_pickup', data: { name: known.name, pickupAddress: known.pickupAddress, pickupCoords: known.pickupCoords }, isReturning: false };
+        sessions.set(phone, session);
+        await sendWhatsApp(phone, `Olá, *${known.name}*! 😊 Bem-vindo de volta ao *ZAP Entregas*! 🛵\n\nVai retirar no mesmo local da última vez?\n📍 _${known.pickupAddress}_\n\nResponda *SIM* ou informe o novo endereço de retirada.`);
+      } else {
+        session = { state: 'collect_name', data: {}, isReturning: false };
+        sessions.set(phone, session);
+        await sendWhatsApp(phone, `Olá! 👋 Bem-vindo ao *ZAP Entregas*! 🛵\n\nSou seu assistente de entregas por motoboy.\n\nComo posso te chamar?`);
+      }
       return;
     }
-    const known = clients.get(phone);
-    if (known) {
-      session = { state: 'confirm_pickup', data: { name: known.name, pickupAddress: known.pickupAddress, pickupCoords: known.pickupCoords }, isReturning: false };
-      sessions.set(phone, session);
-      await sendWhatsApp(phone, `Olá, *${known.name}*! 😊 Bem-vindo de volta ao *ZAP Entregas*! 🛵\n\nVai retirar no mesmo local da última vez?\n📍 _${known.pickupAddress}_\n\nResponda *SIM* ou informe o novo endereço de retirada.`);
-    } else {
-      session = { state: 'collect_name', data: {}, isReturning: false };
-      sessions.set(phone, session);
-      await sendWhatsApp(phone, `Olá! 👋 Bem-vindo ao *ZAP Entregas*! 🛵\n\nSou seu assistente de entregas por motoboy.\n\nComo posso te chamar?`);
-    }
-    return;
   }
 
   // ── Máquina de estados ────────────────────────────────────────────────────
@@ -656,6 +666,10 @@ async function handleBotMessage(phone, text) {
     }
 
     case 'collect_delivery': {
+      if (!msg) {
+        await sendWhatsApp(phone, `📸 Recebi a foto! Qual é o endereço de entrega?\nEx: _Rua das Flores, 123, Centro, Bragança Paulista_`);
+        return;
+      }
       const addrParsed = await parseAddress(msg);
       if (addrParsed && !addrParsed.complete) {
         const missing = addrParsed.missing?.join(' e ') || 'cidade';
@@ -756,10 +770,17 @@ async function handleBotMessage(phone, text) {
         };
         orders.set(orderId, order);
         await dbSaveOrder(order);
-        session.state   = 'waiting_driver';
         session.orderId = orderId;
-        sessions.set(phone, session);
-        await sendWhatsApp(phone, `✅ *Pedido #${orderId} registrado!*\n\n🔍 Buscando entregador disponível...\nVocê será avisado assim que um motoboy aceitar.\n\nPara cancelar, responda *CANCELAR*.`);
+        if (session.isPartner) {
+          session.state = 'partner_more_orders';
+          sessions.set(phone, session);
+          await sendWhatsApp(phone, `✅ *Pedido #${orderId} registrado!* 🛵\n\n🔍 Buscando entregador... O link de rastreio chega assim que alguém aceitar.`);
+          await sendWhatsApp(phone, `Tem mais pedidos? Mande a próxima foto com o endereço na legenda ou responda *NÃO* para encerrar.`);
+        } else {
+          session.state = 'waiting_driver';
+          sessions.set(phone, session);
+          await sendWhatsApp(phone, `✅ *Pedido #${orderId} registrado!*\n\n🔍 Buscando entregador disponível...\nVocê será avisado assim que um motoboy aceitar.\n\nPara cancelar, responda *CANCELAR*.`);
+        }
         await createRequestFromOrder(orderId);
       } else if (intent === 'cancel') {
         sessions.delete(phone);
@@ -797,6 +818,35 @@ async function handleBotMessage(phone, text) {
       const order = orders.get(session.orderId);
       const trackingUrl = order?.deliveryId ? `${HOST_URL}/track/${order.deliveryId}` : null;
       await sendWhatsApp(phone, `🛵 Seu pedido *#${session.orderId}* está em andamento.${trackingUrl ? `\n\n📍 Rastreie em: ${trackingUrl}` : ''}`);
+      break;
+    }
+
+    case 'partner_more_orders': {
+      if (NO_RE.test(msg) && !hasPhoto) {
+        sessions.delete(phone);
+        await sendWhatsApp(phone, `✅ Pedidos registrados. Até logo! 😊`);
+        break;
+      }
+      // Nova foto ou mensagem com endereço — reinicia como nova entrega
+      const p = partners.get(phone);
+      if (p) {
+        session.data = { name: p.name, pickupAddress: p.pickupAddress, pickupCoords: p.pickupCoords, packageType: p.defaultPackage };
+      } else {
+        delete session.data.deliveryAddress;
+        delete session.data.deliveryCoords;
+        delete session.data.distanceKm;
+        delete session.data.freightPrice;
+      }
+      delete session._pendingDelivery;
+      session.state = 'collect_delivery';
+      sessions.set(phone, session);
+      if (!msg) {
+        // Foto sem legenda
+        await sendWhatsApp(phone, `📸 Recebi a foto! Qual é o endereço de entrega?`);
+      } else {
+        // Já veio com endereço (legenda da foto ou texto) — processa direto
+        await handleBotMessage(phone, text, opts);
+      }
       break;
     }
 
