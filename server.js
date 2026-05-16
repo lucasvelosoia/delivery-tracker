@@ -93,8 +93,10 @@ async function dbInit() {
       pickup_lat      DOUBLE PRECISION NOT NULL,
       pickup_lng      DOUBLE PRECISION NOT NULL,
       default_package TEXT DEFAULT 'entrega',
+      activation_code TEXT UNIQUE,
       created_at      TIMESTAMPTZ DEFAULT NOW()
     );
+    ALTER TABLE partners ADD COLUMN IF NOT EXISTS activation_code TEXT UNIQUE;
   `);
   const rows = await db.query('SELECT * FROM establishments');
   for (const r of rows.rows)
@@ -110,7 +112,7 @@ async function dbInit() {
     drivers.set(r.phone, { phone: r.phone, name: r.name, active: r.active, createdAt: r.created_at?.toISOString?.() || r.created_at });
   const partnerRows = await db.query('SELECT * FROM partners ORDER BY created_at DESC');
   for (const r of partnerRows.rows)
-    registerPartner({ phone: r.phone, name: r.name, pickupAddress: r.pickup_address, pickupCoords: { lat: r.pickup_lat, lng: r.pickup_lng }, defaultPackage: r.default_package, createdAt: r.created_at?.toISOString?.() || r.created_at });
+    registerPartner({ phone: r.phone, name: r.name, pickupAddress: r.pickup_address, pickupCoords: { lat: r.pickup_lat, lng: r.pickup_lng }, defaultPackage: r.default_package, activationCode: r.activation_code || null, createdAt: r.created_at?.toISOString?.() || r.created_at });
   console.log(`✅ PostgreSQL conectado — ${rows.rows.length} estabelecimento(s), ${clientRows.rows.length} cliente(s), ${orderRows.rows.length} pedido(s), ${driverRows.rows.length} entregador(es), ${partnerRows.rows.length} parceiro(s)`);
 }
 
@@ -148,7 +150,8 @@ const establishments  = new Map();
 const clients         = new Map(); // phone → { name, pickupAddress, pickupCoords }
 const orders          = new Map();
 const drivers         = new Map(); // phone → { name, phone, active, createdAt }
-const partners        = new Map(); // phone → { name, pickupAddress, pickupCoords, defaultPackage }
+const partners        = new Map(); // phone/variant → partner obj
+const partnerCodes    = new Map(); // activationCode.toLowerCase() → partner obj
 
 // ── WhatsApp auth state persistente no PostgreSQL ────────────────────────────
 async function usePostgresAuthState(pool) {
@@ -531,6 +534,7 @@ function partnerPhoneVariants(phone) {
 
 function registerPartner(p) {
   for (const v of partnerPhoneVariants(p.phone)) partners.set(v, p);
+  if (p.activationCode) partnerCodes.set(p.activationCode.toLowerCase(), p);
 }
 
 function findPartner(jid) {
@@ -545,6 +549,16 @@ async function handleBotMessage(phone, text, opts = {}) {
   const msg      = text.trim();
   const hasPhoto = opts.hasPhoto || false;
   let session = sessions.get(phone);
+
+  // ── Código de ativação de parceiro ────────────────────────────────────────
+  const codePartner = msg ? partnerCodes.get(msg.toLowerCase()) : null;
+  if (codePartner) {
+    sessions.delete(phone);
+    const s = { state: 'collect_delivery', data: { name: codePartner.name, pickupAddress: codePartner.pickupAddress, pickupCoords: codePartner.pickupCoords, packageType: codePartner.defaultPackage }, isPartner: true };
+    sessions.set(phone, s);
+    await sendWhatsApp(phone, `✅ Modo parceiro ativado! Olá, *${codePartner.name}*! 😊\n\nMande a foto do pedido com o endereço na legenda, ou só o endereço de entrega.`);
+    return;
+  }
 
   // Se a sessão existe mas não é de parceiro, verifica se o número agora é parceiro
   if (session && !session.isPartner) {
@@ -937,11 +951,13 @@ app.get('/painel', (req, res) => {
     <td><button class="btn-danger" onclick="removeDriver('${d.phone}')">Remover</button></td>
   </tr>`).join('');
 
-  const partnerList = [...partners.values()].map(p => `<tr>
+  const uniquePartners = [...new Map([...partners.values()].map(p => [p.phone, p])).values()];
+  const partnerList = uniquePartners.map(p => `<tr>
     <td>${p.name}</td>
     <td>${p.phone}</td>
     <td>${p.pickupAddress}</td>
     <td>${p.defaultPackage}</td>
+    <td><code style="background:#f0fdf4;padding:2px 6px;border-radius:4px;font-weight:bold">${p.activationCode || '-'}</code></td>
     <td>${dt(p.createdAt)}</td>
     <td><button class="btn-danger" onclick="removePartner('${p.phone}')">Remover</button></td>
   </tr>`).join('');
@@ -1028,12 +1044,13 @@ ${driverList || '<tr><td colspan="4" class="empty">Nenhum entregador cadastrado<
         <input id="prt-phone" placeholder="WhatsApp (ex: 11999990000)" required>
         <input id="prt-addr" placeholder="Endereço de retirada" required style="min-width:220px">
         <input id="prt-pkg" placeholder="Tipo de entrega padrão (ex: flores)">
+        <input id="prt-code" placeholder="Código de ativação (ex: flores123)" required>
         <button type="submit" class="btn btn-green">+ Cadastrar</button>
       </form>
     </div>
-    <table><thead><tr><th>Nome</th><th>Telefone</th><th>Endereço de retirada</th><th>Pacote padrão</th><th>Cadastrado em</th><th></th></tr></thead>
+    <table><thead><tr><th>Nome</th><th>Telefone</th><th>Endereço de retirada</th><th>Pacote padrão</th><th>Código de ativação</th><th>Cadastrado em</th><th></th></tr></thead>
     <tbody>
-${partnerList || '<tr><td colspan="6" class="empty">Nenhum parceiro cadastrado</td></tr>'}
+${partnerList || '<tr><td colspan="7" class="empty">Nenhum parceiro cadastrado</td></tr>'}
     </tbody></table>
   </div>
 </div>
@@ -1093,9 +1110,10 @@ async function addPartner(e) {
   const phone          = document.getElementById('prt-phone').value.trim();
   const pickupAddress  = document.getElementById('prt-addr').value.trim();
   const defaultPackage = document.getElementById('prt-pkg').value.trim() || 'entrega';
-  const res = await api('POST', '/admin/partner', { name, phone, pickupAddress, defaultPackage });
-  if (res.ok) { toast('Parceiro cadastrado!'); setTimeout(() => location.reload(), 800); }
-  else toast(res.error || 'Erro ao geocodificar o endereço', false);
+  const activationCode = document.getElementById('prt-code').value.trim();
+  const res = await api('POST', '/admin/partner', { name, phone, pickupAddress, defaultPackage, activationCode });
+  if (res.ok) { toast('Parceiro cadastrado! Codigo: ' + (res.partner.activationCode || '-')); setTimeout(() => location.reload(), 800); }
+  else toast(res.error || 'Erro ao geocodificar o endereco', false);
 }
 
 async function removePartner(phone) {
@@ -1200,14 +1218,15 @@ app.get('/admin/partners', requireAdmin, (_req, res) =>
 app.post('/admin/partner', requireAdmin, async (req, res) => {
   const { phone, name, pickupAddress } = req.body;
   if (!phone || !name || !pickupAddress) return res.status(400).json({ error: 'phone, name e pickupAddress obrigatórios' });
-  const defaultPackage = req.body.defaultPackage || 'entrega';
+  const defaultPackage   = req.body.defaultPackage || 'entrega';
+  const activationCode   = req.body.activationCode ? String(req.body.activationCode).trim() : null;
   const coords = await geocode(pickupAddress);
   if (!coords) return res.status(400).json({ error: 'Não foi possível geocodificar o endereço de retirada' });
-  const partner = { phone: String(phone).replace(/\D/g, ''), name: name.trim(), pickupAddress, pickupCoords: coords, defaultPackage, createdAt: new Date().toISOString() };
+  const partner = { phone: String(phone).replace(/\D/g, ''), name: name.trim(), pickupAddress, pickupCoords: coords, defaultPackage, activationCode, createdAt: new Date().toISOString() };
   registerPartner(partner);
   if (db) await db.query(
-    'INSERT INTO partners(phone,name,pickup_address,pickup_lat,pickup_lng,default_package) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(phone) DO UPDATE SET name=$2,pickup_address=$3,pickup_lat=$4,pickup_lng=$5,default_package=$6',
-    [partner.phone, partner.name, partner.pickupAddress, coords.lat, coords.lng, partner.defaultPackage]
+    'INSERT INTO partners(phone,name,pickup_address,pickup_lat,pickup_lng,default_package,activation_code) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(phone) DO UPDATE SET name=$2,pickup_address=$3,pickup_lat=$4,pickup_lng=$5,default_package=$6,activation_code=$7',
+    [partner.phone, partner.name, partner.pickupAddress, coords.lat, coords.lng, partner.defaultPackage, partner.activationCode]
   ).catch(e => console.error('savePartner:', e.message));
   res.json({ ok: true, partner });
 });
